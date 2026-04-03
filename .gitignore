@@ -1,0 +1,16 @@
+.env
+.env.local
+.python-version
+
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+data/
+
+*.egg-info/
+.coverage
+htmlcov/
+
+.DS_Store
