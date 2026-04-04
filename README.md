@@ -126,6 +126,16 @@ At minimum, verify:
 - the latest app version is published
 
 ## Build The Index
+Start Docker container:
+
+```bash
+docker run -d \
+  --name qdrant \
+  -p 6333:6333 \
+  -p 6334:6334 \
+  -v "$(pwd)/data/qdrant_storage:/qdrant/storage" \
+  qdrant/qdrant
+```
 
 Run the manual ingestion step before starting the bot:
 
