@@ -208,12 +208,6 @@ print(invoke_agent("这个知识库里主要讲了什么？", thread_id="local-s
 PY
 ```
 
-## 开发者上手
-
-如果你是新加入项目、想先看一份面向代码结构的上手说明，请参考：
-
-- `docs/project-onboarding.md`
-
 ## 运行机器人
 
 ```bash
