@@ -1,15 +1,18 @@
 # Feishu Wiki RAG Agent
 
-A lightweight, open-source Feishu knowledge assistant built with Deep Agents.
+A lightweight Feishu knowledge assistant built on Deep Agents and backed by a Qdrant-based multimodal RAG pipeline.
 
-This project connects to Feishu through websocket events, indexes Feishu Wiki and Docs content into a local Chroma vector store, and answers user questions with retrieval-augmented generation. It is designed as a practical starter project for teams that want a Feishu bot with local indexing, provider-flexible model access, and minimal operational setup.
+This project connects to Feishu through websocket events, indexes Feishu Wiki and Docs content into Qdrant, and answers user questions through a Deep Agent runtime. The agent can answer simple conversational prompts directly, and it can delegate documentation lookup to a dedicated knowledge retrieval subagent powered by the local multimodal RAG pipeline.
 
 ## Features
 
 - Feishu bot integration over websocket
-- Feishu Wiki and Docs ingestion into a local vector store
-- Deep Agents-based question answering with a dedicated RAG tool
+- Deep Agents runtime as the main orchestration layer
+- Dedicated retrieval subagent for documentation questions
+- Feishu Wiki and Docs ingestion into Qdrant
+- Multimodal RAG pipeline for retrieval, rerank, merge, and answer generation
 - Separate chat-model and embedding-model provider configuration
+- Optional image OCR / caption indexing pipeline for multimodal content
 - Local `AGENTS.md` memory and `SKILL.md` guidance for answer behavior
 - Source-aware answers that can cite the indexed document title or link
 
@@ -18,19 +21,22 @@ This project connects to Feishu through websocket events, indexes Feishu Wiki an
 The main runtime flow is:
 
 1. Feishu sends a websocket event to the bot
-2. `feishu_channel.py` normalizes the incoming message
-3. The Deep Agent calls `search_feishu_knowledge`
-4. The retriever queries local Chroma data built from Feishu docs
-5. The chat model answers based on retrieved context
+2. `channel/feishu/feishu_channel.py` normalizes the incoming message
+3. `agent.py` invokes the Deep Agent runtime with a stable `thread_id`
+4. The main agent decides whether the request needs knowledge retrieval
+5. Retrieval-heavy questions are delegated to the `knowledge_retriever` subagent
+6. The retrieval subagent uses the multimodal `RAGQueryPipeline` to prepare context from Qdrant
+7. The main agent produces the final reply and sends it back to Feishu
 6. The reply is sent back to Feishu
 
 The indexing flow is:
 
 1. Read configured Wiki node tokens or direct `doc` / `docx` tokens
 2. Fetch readable Feishu document content
-3. Split content into chunks
+3. Convert content into markdown chunks
 4. Generate embeddings
-5. Persist the index locally in Chroma
+5. Persist the index in Qdrant
+6. Write an index manifest to `data/index_manifest.json`
 
 ## Project Layout
 
@@ -41,9 +47,20 @@ feishu_wiki_rag_agent/
 ├── README.md
 ├── agent.py
 ├── config.py
-├── feishu_channel.py
-├── feishu_client.py
+├── channel/
+│   ├── __init__.py
+│   └── feishu/
+│       ├── __init__.py
+│       ├── feishu_channel.py
+│       └── feishu_client.py
 ├── indexer.py
+├── multimodal_rag_agent/
+│   ├── api/
+│   ├── docreader_service/
+│   ├── image_resolver/
+│   ├── ingest_pipeline/
+│   ├── multimodal_image_pipeline/
+│   └── rag_query_pipeline/
 ├── pyproject.toml
 ├── retrieval.py
 ├── schemas.py
@@ -51,7 +68,8 @@ feishu_wiki_rag_agent/
 │   └── knowledge-qa/
 │       └── SKILL.md
 ├── tests/
-│   └── test_feishu_wiki_rag_agent.py
+│   ├── test_feishu_wiki_rag_agent.py
+│   └── test_multimodal_rag_agent.py
 └── .env.example
 ```
 
@@ -59,14 +77,27 @@ feishu_wiki_rag_agent/
 
 - Python 3.11+
 - `uv`
+- Qdrant
 - A Feishu self-built app with bot, message, and wiki/doc read permissions
 - One OpenAI-compatible chat model endpoint
 - One OpenAI-compatible embedding model endpoint
+- Dependencies required by Deep Agents runtime
 
 ## Installation
 
 ```bash
 uv sync
+```
+
+Start Qdrant before indexing or querying. For local development, a persistent Docker run is recommended:
+
+```bash
+docker run -d \
+  --name qdrant \
+  -p 6333:6333 \
+  -p 6334:6334 \
+  -v "$(pwd)/data/qdrant_storage:/qdrant/storage" \
+  qdrant/qdrant
 ```
 
 ## Configuration
@@ -96,10 +127,18 @@ Optional variables:
 FEISHU_RAG_TOP_K=4
 FEISHU_RAG_COLLECTION=feishu_wiki_docs
 FEISHU_RAG_DATA_DIR=./data
-FEISHU_RAG_CHROMA_DIR=./data/chroma
 FEISHU_RAG_MANIFEST=index_manifest.json
 FEISHU_API_BASE=https://open.feishu.cn
 FEISHU_REQUEST_TIMEOUT=20
+
+MULTIMODAL_RAG_QDRANT_URL=http://127.0.0.1:6333
+MULTIMODAL_RAG_QDRANT_API_KEY=
+MULTIMODAL_RAG_QDRANT_COLLECTION=feishu_wiki_docs
+MULTIMODAL_RAG_VECTOR_SIZE=1536
+MULTIMODAL_RAG_TOP_K=6
+MULTIMODAL_RAG_RERANK_TOP_K=4
+MULTIMODAL_RAG_CHUNK_SIZE=512
+MULTIMODAL_RAG_CHUNK_OVERLAP=128
 ```
 
 If you prefer one provider for both chat and embeddings, you can use:
@@ -130,7 +169,7 @@ At minimum, verify:
 Run the manual ingestion step before starting the bot:
 
 ```bash
-uv run python -m feishu_wiki_rag_agent.indexer
+uv run python indexer.py
 ```
 
 This command:
@@ -139,13 +178,26 @@ This command:
 2. Downloads supported Feishu Wiki or Doc content
 3. Splits documents into chunks
 4. Generates embeddings
-5. Stores them in local Chroma
+5. Stores them in Qdrant
 6. Writes an index manifest to `data/index_manifest.json`
+
+If you change the embedding model, update `MULTIMODAL_RAG_VECTOR_SIZE` to match the model output dimension before rebuilding the index.
+
+## Quick Local Test
+
+After building the index, you can smoke-test the Deep Agent locally without Feishu:
+
+```bash
+uv run python - <<'PY'
+from agent import invoke_agent
+print(invoke_agent("这个知识库里主要讲了什么？", thread_id="local-smoke-test"))
+PY
+```
 
 ## Run The Bot
 
 ```bash
-uv run python -m feishu_wiki_rag_agent.feishu_channel
+uv run python channel/feishu/feishu_channel.py
 ```
 
 Then test it in Feishu:
@@ -156,9 +208,11 @@ Then test it in Feishu:
 ## Notes
 
 - Only `FEISHU_EVENT_MODE=websocket` is supported in this version
-- This project currently replies with text only
+- The main Feishu runtime now uses Deep Agents as the orchestration layer
+- Documentation retrieval is delegated to a dedicated `knowledge_retriever` subagent
+- This project currently replies with text only, even if image-derived OCR/caption chunks are indexed
 - Group chats only trigger a response when the bot is mentioned
-- The package name uses underscores because `python -m` module paths cannot reliably use hyphens
+- If you change the embedding model, make sure `MULTIMODAL_RAG_VECTOR_SIZE` matches the model output dimension exactly
 
 ## GitHub Upload Checklist
 
@@ -166,7 +220,7 @@ Before pushing this project to GitHub:
 
 - Remove or ignore your real `.env` file and keep only `.env.example`
 - Do not commit real API keys, Feishu app secrets, or provider tokens
-- Do not commit `data/` if it contains local vector indexes or document-derived content
+- Do not commit anything under `data/`; it may contain Qdrant storage, manifests, extracted images, and document-derived content
 - Do not commit `.venv/`, `__pycache__/`, `.pytest_cache/`, or `*.egg-info/`
 - Keep `uv.lock` checked in so others can reproduce the environment with `uv sync`
 - Re-read `README.md` and make sure the setup steps still match your current provider configuration

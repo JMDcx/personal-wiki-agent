@@ -6,16 +6,22 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "deepagents>=0.3.5",
+    "fastapi>=0.115.0",
     "langchain>=1.0,<2.0",
     "langchain-core>=1.0,<2.0",
     "langsmith>=0.3.0",
     "langchain-openai>=1.0.0",
     "langchain-text-splitters>=1.0.0",
-    "langchain-chroma>=1.0.0",
     "lark-oapi>=1.4.18",
+    "openai>=1.75.0",
+    "pillow>=10.0.0",
+    "python-multipart>=0.0.9",
+    "qdrant-client>=1.9.0",
     "requests>=2.32.0",
     "python-dotenv>=1.0.0",
     "rich>=14.0.0",
+    "uvicorn>=0.30.0",
+    "langgraph-checkpoint-sqlite>=3.0.3",
 ]
 
 [dependency-groups]
@@ -28,7 +34,18 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["feishu_wiki_rag_agent"]
+packages = [
+    "feishu_wiki_rag_agent",
+    "feishu_wiki_rag_agent.channel",
+    "feishu_wiki_rag_agent.channel.feishu",
+    "multimodal_rag_agent",
+    "multimodal_rag_agent.api",
+    "multimodal_rag_agent.docreader_service",
+    "multimodal_rag_agent.image_resolver",
+    "multimodal_rag_agent.ingest_pipeline",
+    "multimodal_rag_agent.multimodal_image_pipeline",
+    "multimodal_rag_agent.rag_query_pipeline",
+]
 
 [tool.setuptools.package-dir]
 feishu_wiki_rag_agent = "."

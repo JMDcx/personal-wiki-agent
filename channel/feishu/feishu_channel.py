@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 from feishu_wiki_rag_agent.agent import invoke_agent
 from feishu_wiki_rag_agent.config import Settings, get_settings
-from feishu_wiki_rag_agent.feishu_client import FeishuClient
+from feishu_wiki_rag_agent.channel.feishu.feishu_client import FeishuClient
 from feishu_wiki_rag_agent.schemas import IncomingMessage
 
 LARK_SDK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None

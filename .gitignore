@@ -4,10 +4,14 @@
 
 .venv/
 .pytest_cache/
+tests/
 __pycache__/
 *.py[cod]
 
-data/
+/data/
+/data/**
+/data/qdrant_storage/
+/data/qdrant_storage/**
 
 *.egg-info/
 .coverage

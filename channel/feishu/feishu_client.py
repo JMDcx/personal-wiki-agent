@@ -9,9 +9,16 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from langchain_core.documents import Document
 
 from feishu_wiki_rag_agent.config import Settings, get_settings
+
+try:
+    from langchain_core.documents import Document
+except ModuleNotFoundError:  # pragma: no cover - local fallback
+    @dataclass
+    class Document:
+        page_content: str
+        metadata: dict[str, Any]
 
 
 SUPPORTED_DOC_TYPES = {"doc", "docx"}

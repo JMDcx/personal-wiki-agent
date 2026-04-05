@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import os
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 def _split_csv_env(name: str) -> list[str]:
@@ -32,11 +38,11 @@ class Settings:
             )
         )
     )
-    chroma_dir: Path = field(
+    checkpoint_db_path: Path = field(
         default_factory=lambda: Path(
             os.getenv(
-                "FEISHU_RAG_CHROMA_DIR",
-                str(Path(__file__).resolve().parent / "data" / "chroma"),
+                "FEISHU_AGENT_CHECKPOINT_DB_PATH",
+                str(Path(__file__).resolve().parent / "data" / "deepagents" / "checkpoints.sqlite"),
             )
         )
     )
@@ -59,13 +65,13 @@ class Settings:
     rag_model: str = field(default_factory=lambda: os.getenv("FEISHU_RAG_MODEL", "gpt-4.1-mini"))
     rag_top_k: int = field(default_factory=lambda: int(os.getenv("FEISHU_RAG_TOP_K", "4")))
     embedding_model: str = field(default_factory=lambda: os.getenv("FEISHU_RAG_EMBEDDING_MODEL", "text-embedding-3-small"))
-    chroma_collection_name: str = field(default_factory=lambda: os.getenv("FEISHU_RAG_COLLECTION", "feishu_wiki_docs"))
     manifest_name: str = field(default_factory=lambda: os.getenv("FEISHU_RAG_MANIFEST", "index_manifest.json"))
 
     def ensure_directories(self) -> None:
         """Create local directories used by the example."""
         self.rag_data_dir.mkdir(parents=True, exist_ok=True)
-        self.chroma_dir.mkdir(parents=True, exist_ok=True)
+        with suppress(Exception):
+            self.checkpoint_db_path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
     def manifest_path(self) -> Path:
