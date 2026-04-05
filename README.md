@@ -207,12 +207,6 @@ print(invoke_agent("这个知识库里主要讲了什么？", thread_id="local-s
 PY
 ```
 
-## Developer Onboarding
-
-If you are joining the project and want a code-structure-oriented walkthrough, see:
-
-- `docs/project-onboarding.md`
-
 ## Run The Bot
 
 ```bash
