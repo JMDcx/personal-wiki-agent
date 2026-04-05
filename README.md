@@ -1,5 +1,7 @@
 # Feishu Wiki RAG Agent
 
+English | [简体中文](./README.zh-CN.md)
+
 A lightweight Feishu knowledge assistant built on Deep Agents and backed by a Qdrant-based multimodal RAG pipeline.
 
 This project connects to Feishu through websocket events, indexes Feishu Wiki and Docs content into Qdrant, and answers user questions through a Deep Agent runtime. The agent can answer simple conversational prompts directly, and it can delegate documentation lookup to a dedicated knowledge retrieval subagent powered by the local multimodal RAG pipeline.
@@ -45,6 +47,7 @@ feishu_wiki_rag_agent/
 ├── AGENTS.md
 ├── LICENSE
 ├── README.md
+├── README.zh-CN.md
 ├── agent.py
 ├── config.py
 ├── channel/
@@ -203,6 +206,12 @@ from agent import invoke_agent
 print(invoke_agent("这个知识库里主要讲了什么？", thread_id="local-smoke-test"))
 PY
 ```
+
+## Developer Onboarding
+
+If you are joining the project and want a code-structure-oriented walkthrough, see:
+
+- `docs/project-onboarding.md`
 
 ## Run The Bot
 
