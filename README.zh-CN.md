@@ -2,19 +2,21 @@
 
 [English](./README.md) | 简体中文
 
-一个轻量级的飞书知识助手，基于 Deep Agents 构建，并由基于 Qdrant 的多模态 RAG 流水线提供支持。
+一个轻量级的知识助手，基于 Deep Agents 构建，并由基于 Qdrant 的多模态 RAG 流水线提供支持。
 
-这个项目通过 websocket 事件接入飞书，将飞书 Wiki 和 Docs 内容索引到 Qdrant 中，并通过 Deep Agent runtime 回答用户问题。该 agent 可以直接回答简单的对话类请求，也可以将文档查询委派给一个专门的知识检索子 agent，而这个子 agent 由本地多模态 RAG 流水线驱动。
+这个项目会将飞书 Wiki 和 Docs 内容索引到 Qdrant 中，并通过 Deep Agent runtime 回答用户问题。当前同时支持通过 websocket 接入飞书，以及通过官方 iLink bot 通道接入个人微信。该 agent 可以直接回答简单的对话类请求，也可以将文档查询委派给一个专门的知识检索子 agent，而这个子 agent 由本地多模态 RAG 流水线驱动。
 
 ## 功能特性
 
 - 基于 websocket 的飞书机器人集成
+- 基于官方 iLink bot API 的个人微信接入
 - 以 Deep Agents runtime 作为主编排层
 - 面向文档类问题的专用检索子 agent
 - 将飞书 Wiki 和 Docs 内容写入 Qdrant
 - 包含检索、重排、合并和答案生成的多模态 RAG 流水线
 - 聊天模型和 embedding 模型可分别配置不同 provider
 - 可选的图片 OCR / caption 索引流水线，用于处理多模态内容
+- 微信文本、链接、图片、文件输入适配
 - 使用本地 `AGENTS.md` 记忆和 `SKILL.md` 规范回答行为
 - 具备来源感知能力，回答中可以引用已索引文档的标题或链接
 
@@ -22,14 +24,14 @@
 
 主运行链路如下：
 
-1. 飞书向机器人发送 websocket 事件
-2. `channel/feishu/feishu_channel.py` 对收到的消息进行标准化
-3. `agent.py` 使用稳定的 `thread_id` 调用 Deep Agent runtime
-4. 主 agent 判断当前请求是否需要知识检索
-5. 检索型问题会被委派给 `knowledge_retriever` 子 agent
-6. 检索子 agent 使用多模态 `RAGQueryPipeline` 从 Qdrant 中准备上下文
-7. 主 agent 生成最终回复并发送回飞书
-6. 回复被发送回飞书
+1. 飞书或微信将用户消息交给通道层
+2. `channel/feishu/feishu_channel.py` 或 `channel/weixin/weixin_channel.py` 对消息进行标准化
+3. 通道层把附件适配成文本提示和可选本地图片路径
+4. `agent.py` 使用稳定的 `thread_id` 调用 Deep Agent runtime
+5. 主 agent 判断当前请求是否需要知识检索
+6. 检索型问题会被委派给 `knowledge_retriever` 子 agent
+7. 检索子 agent 使用多模态 `RAGQueryPipeline` 从 Qdrant 中准备上下文
+8. 主 agent 生成最终回复，再由通道发送回用户
 
 索引链路如下：
 
@@ -56,6 +58,11 @@ feishu_wiki_rag_agent/
 │       ├── __init__.py
 │       ├── feishu_channel.py
 │       └── feishu_client.py
+│   └── weixin/
+│       ├── __init__.py
+│       ├── weixin_api.py
+│       ├── weixin_channel.py
+│       └── weixin_message.py
 ├── indexer.py
 ├── multimodal_rag_agent/
 │   ├── api/
@@ -71,8 +78,10 @@ feishu_wiki_rag_agent/
 │   └── knowledge-qa/
 │       └── SKILL.md
 ├── tests/
-│   ├── test_feishu_wiki_rag_agent.py
-│   └── test_multimodal_rag_agent.py
+│   ├── test_agent_controller_flow.py
+│   ├── test_query_understand_service.py
+│   ├── test_sqlite_checkpointer.py
+│   └── test_weixin_channel.py
 └── .env.example
 ```
 
@@ -82,6 +91,7 @@ feishu_wiki_rag_agent/
 - `uv`
 - Qdrant
 - 一个启用了机器人、消息以及 wiki/doc 读取权限的飞书自建应用
+- 如果要使用微信通道，还需要一个 Weixin iLink bot 账号
 - 一个兼容 OpenAI 的聊天模型接口
 - 一个兼容 OpenAI 的 embedding 模型接口
 - Deep Agents runtime 所需依赖
@@ -133,6 +143,12 @@ FEISHU_RAG_DATA_DIR=./data
 FEISHU_RAG_MANIFEST=index_manifest.json
 FEISHU_API_BASE=https://open.feishu.cn
 FEISHU_REQUEST_TIMEOUT=20
+WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com
+WEIXIN_CDN_BASE_URL=https://novac2c.cdn.weixin.qq.com/c2c
+WEIXIN_CREDENTIALS_PATH=./data/weixin/credentials.json
+WEIXIN_TMP_DIR=./data/weixin/tmp
+WEIXIN_REQUEST_TIMEOUT=15
+WEIXIN_LONG_POLL_TIMEOUT=35
 
 MULTIMODAL_RAG_QDRANT_URL=http://127.0.0.1:6333
 MULTIMODAL_RAG_QDRANT_API_KEY=
@@ -150,6 +166,10 @@ MULTIMODAL_RAG_CHUNK_OVERLAP=128
 - `OPENAI_BASE_URL`
 
 当示例专用变量存在时，它们仍然具有更高优先级。
+
+如果你已经拿到了可复用的 Weixin iLink token，也可以直接设置：
+
+- `WEIXIN_TOKEN`
 
 ## 飞书配置
 
@@ -219,6 +239,20 @@ uv run python channel/feishu/feishu_channel.py
 - 给机器人发送私聊消息
 - 或者在群聊里 @ 机器人
 
+如果要运行个人微信通道：
+
+```bash
+uv run python channel/weixin/weixin_channel.py
+```
+
+然后在微信中测试：
+
+- 给官方 iLink 接入生成的机器人助手发送私聊消息
+- 文本消息会直接透传给 agent
+- 链接会先经过本地 docreader 抓取和解析，再交给 agent
+- 图片会通过现有 `images=[...]` 接口传给 agent
+- 文件会先本地解析为 markdown，并附带解析出的图片上下文
+
 ## 说明
 
 - 当前版本仅支持 `FEISHU_EVENT_MODE=websocket`
@@ -226,6 +260,9 @@ uv run python channel/feishu/feishu_channel.py
 - 文档检索被委派给专门的 `knowledge_retriever` 子 agent
 - 当前项目即使索引了图片 OCR/caption chunk，也只返回文本回复
 - 群聊中只有在 @ 机器人时才会触发回复
+- 微信第一版只支持个人单聊和文本回复
+- 微信语音、群聊以及图片/文件回传暂未实现
+- 微信文件理解能力取决于本地 docreader 当前支持的格式
 - 如果你更换 embedding 模型，请确保 `MULTIMODAL_RAG_VECTOR_SIZE` 与模型输出维度完全一致
 
 ## GitHub 上传检查清单

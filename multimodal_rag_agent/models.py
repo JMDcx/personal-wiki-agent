@@ -71,7 +71,6 @@ class IngestResult:
 class QueryBundle:
     raw_query: str
     rewritten_query: str
-    intent: str
     query_keywords: list[str] = field(default_factory=list)
 
 
