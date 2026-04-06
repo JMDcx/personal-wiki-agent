@@ -14,7 +14,6 @@ class PromptContextBuilder:
         sections = [
             f"用户问题：{query_bundle.raw_query}",
             f"改写查询：{query_bundle.rewritten_query}",
-            f"检索意图：{query_bundle.intent}",
             "检索片段：",
         ]
         for index, chunk in enumerate(chunks, start=1):

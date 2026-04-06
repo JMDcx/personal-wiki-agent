@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import atexit
+import logging
 from dataclasses import dataclass
 from datetime import datetime
+from time import perf_counter
 from typing import Any
 
 try:
@@ -45,6 +47,9 @@ except ModuleNotFoundError:  # pragma: no cover - imported lazily in tests
     ChatOpenAI = None  # type: ignore[assignment]
 
 
+logger = logging.getLogger(__name__)
+
+
 NON_RETRIEVAL_INTENTS = {
     "greeting",
     "summarize",
@@ -57,6 +62,13 @@ NON_RETRIEVAL_INTENTS = {
 _AGENT_RUNTIME_CACHE: dict[tuple[str, str, str, str], Any] = {}
 _CHECKPOINTER_CACHE: dict[str, Any] = {}
 _CHECKPOINTER_CONTEXTS: dict[str, Any] = {}
+
+
+def _question_preview(text: str, limit: int = 80) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[: limit - 3]}..."
 
 
 @dataclass(slots=True)
@@ -286,6 +298,7 @@ def _build_controller_context(
     agent_runtime: Any,
     chat_model_supports_vision: bool = False,
 ) -> ControllerInputContext:
+    started_at = perf_counter()
     history = _load_history_from_runtime(agent_runtime, thread_id)
     understand_service = _create_query_understand_service(multimodal_settings)
     understand_result = understand_service.run(
@@ -304,7 +317,7 @@ def _build_controller_context(
         allow_retrieval=allow_retrieval,
     )
     current_time = datetime.now().isoformat(timespec="seconds")
-    return ControllerInputContext(
+    context = ControllerInputContext(
         raw_question=question,
         rewrite_query=understand_result.rewrite_query or question,
         intent=understand_result.intent,
@@ -319,6 +332,17 @@ def _build_controller_context(
             current_time=current_time,
         ),
     )
+    elapsed_ms = (perf_counter() - started_at) * 1000
+    logger.info(
+        "[Timing] controller_context thread_id=%s intent=%s allow_retrieval=%s images=%s elapsed_ms=%.1f question=%r",
+        thread_id,
+        context.intent,
+        "yes" if allow_retrieval else "no",
+        len(images),
+        elapsed_ms,
+        _question_preview(question),
+    )
+    return context
 
 
 def search_knowledge_tool_text(
@@ -328,10 +352,17 @@ def search_knowledge_tool_text(
     pipeline: RAGQueryPipeline | None = None,
 ) -> str:
     """Return prepared RAG context for the agent or fallback snippets when needed."""
+    started_at = perf_counter()
     resolved = settings or get_settings()
     rag_pipeline = pipeline or RAGQueryPipeline(get_multimodal_settings())
     prepared = rag_pipeline.prepare_context(query, with_sources=True)
     if not prepared.merged_chunks:
+        elapsed_ms = (perf_counter() - started_at) * 1000
+        logger.info(
+            "[Timing] search_knowledge empty_result elapsed_ms=%.1f query=%r",
+            elapsed_ms,
+            _question_preview(query),
+        )
         return "当前索引中未找到相关内容。"
 
     lines: list[str] = [prepared.context]
@@ -343,6 +374,14 @@ def search_knowledge_tool_text(
             ]
         )
         lines.append(source_line)
+    elapsed_ms = (perf_counter() - started_at) * 1000
+    logger.info(
+        "[Timing] search_knowledge chunks=%s sources=%s elapsed_ms=%.1f query=%r",
+        len(prepared.merged_chunks),
+        len(prepared.sources),
+        elapsed_ms,
+        _question_preview(query),
+    )
     return "\n\n".join(lines)
 
 
@@ -422,6 +461,7 @@ def invoke_agent(
     language: str = "中文",
 ) -> str:
     """Run the Deep Agent orchestrator backed by the multimodal RAG pipeline."""
+    started_at = perf_counter()
     resolved = settings or get_settings()
     multimodal_settings = get_multimodal_settings()
     agent = _get_or_build_agent_runtime(resolved)
@@ -440,8 +480,21 @@ def invoke_agent(
         messages.append({"role": "system", "content": controller_context.runtime_system_prompt})
     messages.append({"role": "user", "content": controller_context.user_content})
 
+    invoke_started_at = perf_counter()
     result = agent.invoke(
         {"messages": messages},
         config={"configurable": {"thread_id": thread_id}},
     )
-    return extract_final_text(result)
+    invoke_elapsed_ms = (perf_counter() - invoke_started_at) * 1000
+    total_elapsed_ms = (perf_counter() - started_at) * 1000
+    final_text = extract_final_text(result)
+    logger.info(
+        "[Timing] agent_invoke thread_id=%s intent=%s invoke_elapsed_ms=%.1f total_elapsed_ms=%.1f answer_len=%s question=%r",
+        thread_id,
+        controller_context.intent,
+        invoke_elapsed_ms,
+        total_elapsed_ms,
+        len(final_text),
+        _question_preview(question),
+    )
+    return final_text

@@ -4,17 +4,19 @@ English | [简体中文](./README.zh-CN.md)
 
 A lightweight Feishu knowledge assistant built on Deep Agents and backed by a Qdrant-based multimodal RAG pipeline.
 
-This project connects to Feishu through websocket events, indexes Feishu Wiki and Docs content into Qdrant, and answers user questions through a Deep Agent runtime. The agent can answer simple conversational prompts directly, and it can delegate documentation lookup to a dedicated knowledge retrieval subagent powered by the local multimodal RAG pipeline.
+This project indexes Feishu Wiki and Docs content into Qdrant and answers user questions through a Deep Agent runtime. It currently supports Feishu over websocket and personal Weixin through the official iLink bot channel. The agent can answer simple conversational prompts directly, and it can delegate documentation lookup to a dedicated knowledge retrieval subagent powered by the local multimodal RAG pipeline.
 
 ## Features
 
 - Feishu bot integration over websocket
+- Personal Weixin integration over the official iLink bot API
 - Deep Agents runtime as the main orchestration layer
 - Dedicated retrieval subagent for documentation questions
 - Feishu Wiki and Docs ingestion into Qdrant
 - Multimodal RAG pipeline for retrieval, rerank, merge, and answer generation
 - Separate chat-model and embedding-model provider configuration
 - Optional image OCR / caption indexing pipeline for multimodal content
+- Weixin attachment adaptation for text, links, images, and files
 - Local `AGENTS.md` memory and `SKILL.md` guidance for answer behavior
 - Source-aware answers that can cite the indexed document title or link
 
@@ -22,14 +24,14 @@ This project connects to Feishu through websocket events, indexes Feishu Wiki an
 
 The main runtime flow is:
 
-1. Feishu sends a websocket event to the bot
-2. `channel/feishu/feishu_channel.py` normalizes the incoming message
-3. `agent.py` invokes the Deep Agent runtime with a stable `thread_id`
-4. The main agent decides whether the request needs knowledge retrieval
-5. Retrieval-heavy questions are delegated to the `knowledge_retriever` subagent
-6. The retrieval subagent uses the multimodal `RAGQueryPipeline` to prepare context from Qdrant
-7. The main agent produces the final reply and sends it back to Feishu
-6. The reply is sent back to Feishu
+1. Feishu or Weixin delivers an incoming user message to the channel layer
+2. `channel/feishu/feishu_channel.py` or `channel/weixin/weixin_channel.py` normalizes the message
+3. The channel adapts attachments into a text prompt plus optional local image paths
+4. `agent.py` invokes the Deep Agent runtime with a stable `thread_id`
+5. The main agent decides whether the request needs knowledge retrieval
+6. Retrieval-heavy questions are delegated to the `knowledge_retriever` subagent
+7. The retrieval subagent uses the multimodal `RAGQueryPipeline` to prepare context from Qdrant
+8. The main agent produces the final reply and the channel sends it back to the user
 
 The indexing flow is:
 
@@ -56,6 +58,11 @@ feishu_wiki_rag_agent/
 │       ├── __init__.py
 │       ├── feishu_channel.py
 │       └── feishu_client.py
+│   └── weixin/
+│       ├── __init__.py
+│       ├── weixin_api.py
+│       ├── weixin_channel.py
+│       └── weixin_message.py
 ├── indexer.py
 ├── multimodal_rag_agent/
 │   ├── api/
@@ -71,8 +78,10 @@ feishu_wiki_rag_agent/
 │   └── knowledge-qa/
 │       └── SKILL.md
 ├── tests/
-│   ├── test_feishu_wiki_rag_agent.py
-│   └── test_multimodal_rag_agent.py
+│   ├── test_agent_controller_flow.py
+│   ├── test_query_understand_service.py
+│   ├── test_sqlite_checkpointer.py
+│   └── test_weixin_channel.py
 └── .env.example
 ```
 
@@ -82,6 +91,7 @@ feishu_wiki_rag_agent/
 - `uv`
 - Qdrant
 - A Feishu self-built app with bot, message, and wiki/doc read permissions
+- A Weixin iLink bot account if you want to use the Weixin channel
 - One OpenAI-compatible chat model endpoint
 - One OpenAI-compatible embedding model endpoint
 - Dependencies required by Deep Agents runtime
@@ -133,6 +143,12 @@ FEISHU_RAG_DATA_DIR=./data
 FEISHU_RAG_MANIFEST=index_manifest.json
 FEISHU_API_BASE=https://open.feishu.cn
 FEISHU_REQUEST_TIMEOUT=20
+WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com
+WEIXIN_CDN_BASE_URL=https://novac2c.cdn.weixin.qq.com/c2c
+WEIXIN_CREDENTIALS_PATH=./data/weixin/credentials.json
+WEIXIN_TMP_DIR=./data/weixin/tmp
+WEIXIN_REQUEST_TIMEOUT=15
+WEIXIN_LONG_POLL_TIMEOUT=35
 
 MULTIMODAL_RAG_QDRANT_URL=http://127.0.0.1:6333
 MULTIMODAL_RAG_QDRANT_API_KEY=
@@ -150,6 +166,10 @@ If you prefer one provider for both chat and embeddings, you can use:
 - `OPENAI_BASE_URL`
 
 The example-specific variables still take precedence when present.
+
+If you already have a valid Weixin iLink token, you can also set:
+
+- `WEIXIN_TOKEN`
 
 ## Feishu Setup
 
@@ -218,6 +238,20 @@ Then test it in Feishu:
 - send a direct message to the bot
 - or mention the bot in a group chat
 
+To run the personal Weixin channel instead:
+
+```bash
+uv run python channel/weixin/weixin_channel.py
+```
+
+Then test it in Weixin:
+
+- send a direct message to the bot assistant created by the official iLink integration
+- text messages are passed through directly
+- links are fetched with the local docreader before being sent to the agent
+- images are passed as local files through the existing `images=[...]` agent interface
+- files are parsed locally and sent as extracted markdown plus any extracted images
+
 ## Notes
 
 - Only `FEISHU_EVENT_MODE=websocket` is supported in this version
@@ -225,6 +259,9 @@ Then test it in Feishu:
 - Documentation retrieval is delegated to a dedicated `knowledge_retriever` subagent
 - This project currently replies with text only, even if image-derived OCR/caption chunks are indexed
 - Group chats only trigger a response when the bot is mentioned
+- The first Weixin version only supports personal direct chat and text replies
+- Weixin voice input, group chat, and media replies are not implemented yet
+- Weixin file understanding depends on the local docreader's supported formats
 - If you change the embedding model, make sure `MULTIMODAL_RAG_VECTOR_SIZE` matches the model output dimension exactly
 
 ## GitHub Upload Checklist

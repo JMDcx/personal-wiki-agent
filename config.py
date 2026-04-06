@@ -30,11 +30,34 @@ class Settings:
     feishu_event_mode: str = field(default_factory=lambda: os.getenv("FEISHU_EVENT_MODE", "websocket"))
     feishu_wiki_root_tokens: list[str] = field(default_factory=lambda: _split_csv_env("FEISHU_WIKI_ROOT_TOKENS"))
     feishu_request_timeout: int = field(default_factory=lambda: int(os.getenv("FEISHU_REQUEST_TIMEOUT", "20")))
+    weixin_base_url: str = field(default_factory=lambda: os.getenv("WEIXIN_BASE_URL", "https://ilinkai.weixin.qq.com"))
+    weixin_cdn_base_url: str = field(
+        default_factory=lambda: os.getenv("WEIXIN_CDN_BASE_URL", "https://novac2c.cdn.weixin.qq.com/c2c")
+    )
+    weixin_token: str = field(default_factory=lambda: os.getenv("WEIXIN_TOKEN", ""))
+    weixin_request_timeout: int = field(default_factory=lambda: int(os.getenv("WEIXIN_REQUEST_TIMEOUT", "15")))
+    weixin_long_poll_timeout: int = field(default_factory=lambda: int(os.getenv("WEIXIN_LONG_POLL_TIMEOUT", "35")))
     rag_data_dir: Path = field(
         default_factory=lambda: Path(
             os.getenv(
                 "FEISHU_RAG_DATA_DIR",
                 str(Path(__file__).resolve().parent / "data"),
+            )
+        )
+    )
+    weixin_credentials_path: Path = field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "WEIXIN_CREDENTIALS_PATH",
+                str(Path(__file__).resolve().parent / "data" / "weixin" / "credentials.json"),
+            )
+        )
+    )
+    weixin_tmp_dir: Path = field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "WEIXIN_TMP_DIR",
+                str(Path(__file__).resolve().parent / "data" / "weixin" / "tmp"),
             )
         )
     )
@@ -70,6 +93,10 @@ class Settings:
     def ensure_directories(self) -> None:
         """Create local directories used by the example."""
         self.rag_data_dir.mkdir(parents=True, exist_ok=True)
+        with suppress(Exception):
+            self.weixin_credentials_path.parent.mkdir(parents=True, exist_ok=True)
+        with suppress(Exception):
+            self.weixin_tmp_dir.mkdir(parents=True, exist_ok=True)
         with suppress(Exception):
             self.checkpoint_db_path.parent.mkdir(parents=True, exist_ok=True)
 
