@@ -5,14 +5,17 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 import requests
 
 try:
     from feishu_wiki_rag_agent.config import Settings, get_settings
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from config import Settings, get_settings
+    from observability.events import log_event, log_exception
 
 
 @dataclass(slots=True)
@@ -63,26 +66,51 @@ class FeishuDepositWriter:
         target_space_id: str,
         target_parent_node_token: str,
     ) -> FeishuWriteResult:
-        file_token = self._upload_markdown_file(file_name=f"{title}.md", markdown_content=markdown_content)
-        import_result = self._create_import_task(
-            file_token=file_token,
+        started_at = perf_counter()
+        log_event(
+            "feishu_write_started",
             title=title,
-            target_parent_node_token=target_parent_node_token,
-        )
-        move_result = self._move_doc_to_wiki(
-            document_token=import_result.document_token,
             target_space_id=target_space_id,
-            target_parent_node_token=target_parent_node_token,
+            has_parent_node=bool(target_parent_node_token),
         )
-        return FeishuWriteResult(
-            document_token=import_result.document_token,
-            document_url=import_result.document_url,
-            wiki_node_token=move_result.wiki_node_token,
-            raw_payload={
-                "import": import_result.raw_payload or {},
-                "move": move_result.raw_payload or {},
-            },
-        )
+        try:
+            file_token = self._upload_markdown_file(file_name=f"{title}.md", markdown_content=markdown_content)
+            import_result = self._create_import_task(
+                file_token=file_token,
+                title=title,
+                target_parent_node_token=target_parent_node_token,
+            )
+            move_result = self._move_doc_to_wiki(
+                document_token=import_result.document_token,
+                target_space_id=target_space_id,
+                target_parent_node_token=target_parent_node_token,
+            )
+            elapsed_ms = (perf_counter() - started_at) * 1000
+            log_event(
+                "feishu_write_completed",
+                title=title,
+                document_token=import_result.document_token,
+                has_wiki_node=bool(move_result.wiki_node_token),
+                duration_ms=round(elapsed_ms, 1),
+            )
+            return FeishuWriteResult(
+                document_token=import_result.document_token,
+                document_url=import_result.document_url,
+                wiki_node_token=move_result.wiki_node_token,
+                raw_payload={
+                    "import": import_result.raw_payload or {},
+                    "move": move_result.raw_payload or {},
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = (perf_counter() - started_at) * 1000
+            log_exception(
+                "feishu_write_failed",
+                exc,
+                title=title,
+                duration_ms=round(elapsed_ms, 1),
+            )
+            raise
 
     def _upload_markdown_file(self, *, file_name: str, markdown_content: str) -> str:
         token = self.feishu_client.fetch_tenant_access_token()

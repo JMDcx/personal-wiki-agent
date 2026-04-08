@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
+
+try:
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception, preview_text
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from observability.events import log_event, log_exception, preview_text
 
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
 from multimodal_rag_agent.models import QueryResponse
@@ -55,27 +61,58 @@ class RAGQueryPipeline:
         with_sources: bool = True,
     ) -> PreparedContext:
         """Run retrieval, rerank, and context assembly without final answer generation."""
-        query_bundle = self.understander.understand(query)
-        retrieved = self.retriever.retrieve(query_bundle.rewritten_query, top_k=top_k, filters=filters)
-        reranked = self.reranker.rerank(query_bundle.rewritten_query, retrieved, top_k=top_k or self.settings.rerank_top_k)
-        merged = self.merger.merge(reranked)
-        context = self.prompt_builder.build(query_bundle, merged)
-        sources: list[dict[str, object]] = []
-        if with_sources:
-            for chunk in merged:
-                sources.append(
-                    {
-                        "title": chunk.metadata.get("title", "Untitled"),
-                        "source_uri": chunk.metadata.get("source_uri", ""),
-                        "chunk_type": chunk.chunk_type,
-                    }
-                )
-        return PreparedContext(
-            query_bundle=query_bundle,
-            merged_chunks=merged,
-            context=context,
-            sources=sources,
+        started_at = perf_counter()
+        log_event(
+            "retrieval_started",
+            query_preview=preview_text(query),
+            requested_top_k=top_k or self.settings.retrieval_top_k,
+            filter_keys=sorted((filters or {}).keys()),
         )
+        try:
+            query_bundle = self.understander.understand(query)
+            retrieved = self.retriever.retrieve(query_bundle.rewritten_query, top_k=top_k, filters=filters)
+            reranked = self.reranker.rerank(
+                query_bundle.rewritten_query,
+                retrieved,
+                top_k=top_k or self.settings.rerank_top_k,
+            )
+            merged = self.merger.merge(reranked)
+            context = self.prompt_builder.build(query_bundle, merged)
+            sources: list[dict[str, object]] = []
+            if with_sources:
+                for chunk in merged:
+                    sources.append(
+                        {
+                            "title": chunk.metadata.get("title", "Untitled"),
+                            "source_uri": chunk.metadata.get("source_uri", ""),
+                            "chunk_type": chunk.chunk_type,
+                        }
+                    )
+            elapsed_ms = (perf_counter() - started_at) * 1000
+            log_event(
+                "retrieval_completed",
+                query_preview=preview_text(query_bundle.rewritten_query),
+                candidate_count=len(retrieved),
+                reranked_count=len(reranked),
+                merged_count=len(merged),
+                source_count=len(sources),
+                duration_ms=round(elapsed_ms, 1),
+            )
+            return PreparedContext(
+                query_bundle=query_bundle,
+                merged_chunks=merged,
+                context=context,
+                sources=sources,
+            )
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = (perf_counter() - started_at) * 1000
+            log_exception(
+                "retrieval_failed",
+                exc,
+                query_preview=preview_text(query),
+                duration_ms=round(elapsed_ms, 1),
+            )
+            raise
 
     def run(
         self,

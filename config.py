@@ -69,6 +69,17 @@ class Settings:
             )
         )
     )
+    log_level: str = field(default_factory=lambda: os.getenv("FEISHU_LOG_LEVEL", "INFO"))
+    log_file_path: Path = field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "FEISHU_LOG_FILE_PATH",
+                str(Path(__file__).resolve().parent / "data" / "logs" / "app.jsonl"),
+            )
+        )
+    )
+    log_max_bytes: int = field(default_factory=lambda: int(os.getenv("FEISHU_LOG_MAX_BYTES", "10485760")))
+    log_backup_count: int = field(default_factory=lambda: int(os.getenv("FEISHU_LOG_BACKUP_COUNT", "5")))
     chat_api_key: str = field(default_factory=lambda: os.getenv(
         "FEISHU_RAG_CHAT_API_KEY",
         os.getenv("OPENAI_API_KEY", ""),
@@ -107,6 +118,8 @@ class Settings:
             self.weixin_tmp_dir.mkdir(parents=True, exist_ok=True)
         with suppress(Exception):
             self.checkpoint_db_path.parent.mkdir(parents=True, exist_ok=True)
+        with suppress(Exception):
+            self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
     def manifest_path(self) -> Path:

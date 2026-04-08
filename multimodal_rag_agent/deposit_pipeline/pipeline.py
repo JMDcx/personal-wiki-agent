@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Callable
+from time import perf_counter
+from typing import Callable
 
 try:
     from feishu_wiki_rag_agent.config import Settings, get_settings
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception, preview_text
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from config import Settings, get_settings
+    from observability.events import log_event, log_exception, preview_text
+
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
 from multimodal_rag_agent.deposit_pipeline.adapters import (
     BaseSourceAdapter,
@@ -52,54 +56,93 @@ class DepositPipeline:
         self.now_provider = now_provider or datetime.now
 
     def run(self, request: DepositRequest) -> DepositResult:
+        started_at = perf_counter()
         normalized = self._normalize_request(request)
-        source = self._select_adapter(normalized).fetch(normalized)
-        draft = self.summarizer(source, normalized.text)
-        final_markdown = self._render_markdown(draft)
         auto_write = self.settings.deposit_enable_auto_write if normalized.auto_write is None else normalized.auto_write
-        if not auto_write:
+        log_event(
+            "deposit_started",
+            text_preview=preview_text(normalized.text),
+            url_count=len(normalized.urls),
+            image_count=len(normalized.image_paths),
+            auto_write=auto_write,
+        )
+        try:
+            source = self._select_adapter(normalized).fetch(normalized)
+            draft = self.summarizer(source, normalized.text)
+            final_markdown = self._render_markdown(draft)
+
+            if not auto_write:
+                elapsed_ms = (perf_counter() - started_at) * 1000
+                log_event(
+                    "deposit_completed",
+                    status="preview",
+                    source_type=source.source_type,
+                    key_point_count=len(draft.key_points),
+                    duration_ms=round(elapsed_ms, 1),
+                )
+                return DepositResult(
+                    status="preview",
+                    message="已生成沉淀草稿预览，未写入飞书或本地索引。",
+                    draft=draft,
+                    final_markdown=final_markdown,
+                    metadata={"source_type": source.source_type, "auto_write": False},
+                )
+
+            target_space_id = normalized.target_space_id or self.settings.feishu_deposit_space_id
+            target_parent_node_token = normalized.target_parent_node_token or self.settings.feishu_deposit_parent_node_token
+            if not target_space_id or not target_parent_node_token:
+                raise DepositSourceError("缺少 FEISHU_DEPOSIT_SPACE_ID 或 FEISHU_DEPOSIT_PARENT_NODE_TOKEN，无法执行沉淀写入。")
+
+            write_result = self.writer.write_markdown(
+                title=draft.feishu_doc_title,
+                markdown_content=final_markdown,
+                target_space_id=target_space_id,
+                target_parent_node_token=target_parent_node_token,
+            )
+            ingest_result = self.ingest_pipeline.ingest_markdown(
+                final_markdown,
+                title=draft.feishu_doc_title,
+                metadata={
+                    **draft.metadata,
+                    "title": draft.feishu_doc_title,
+                    "source_uri": write_result.document_url or draft.source_uri,
+                    "source_type": f"deposit:{draft.source_type}",
+                    "feishu_doc_token": write_result.document_token,
+                    "wiki_node_token": write_result.wiki_node_token,
+                },
+            )
+            elapsed_ms = (perf_counter() - started_at) * 1000
+            log_event(
+                "deposit_completed",
+                status="completed",
+                source_type=source.source_type,
+                local_document_id=ingest_result.document_id,
+                feishu_doc_token=write_result.document_token,
+                has_wiki_node=bool(write_result.wiki_node_token),
+                duration_ms=round(elapsed_ms, 1),
+            )
             return DepositResult(
-                status="preview",
-                message="已生成沉淀草稿预览，未写入飞书或本地索引。",
+                status="completed",
+                message="已完成沉淀，内容已写入飞书并加入本地知识库索引。",
                 draft=draft,
                 final_markdown=final_markdown,
-                metadata={"source_type": source.source_type, "auto_write": False},
+                local_document_id=ingest_result.document_id,
+                feishu_doc_token=write_result.document_token,
+                feishu_doc_url=write_result.document_url,
+                wiki_node_token=write_result.wiki_node_token,
+                metadata={"source_type": source.source_type, "auto_write": True},
             )
-
-        target_space_id = normalized.target_space_id or self.settings.feishu_deposit_space_id
-        target_parent_node_token = normalized.target_parent_node_token or self.settings.feishu_deposit_parent_node_token
-        if not target_space_id or not target_parent_node_token:
-            raise DepositSourceError("缺少 FEISHU_DEPOSIT_SPACE_ID 或 FEISHU_DEPOSIT_PARENT_NODE_TOKEN，无法执行沉淀写入。")
-
-        write_result = self.writer.write_markdown(
-            title=draft.feishu_doc_title,
-            markdown_content=final_markdown,
-            target_space_id=target_space_id,
-            target_parent_node_token=target_parent_node_token,
-        )
-        ingest_result = self.ingest_pipeline.ingest_markdown(
-            final_markdown,
-            title=draft.feishu_doc_title,
-            metadata={
-                **draft.metadata,
-                "title": draft.feishu_doc_title,
-                "source_uri": write_result.document_url or draft.source_uri,
-                "source_type": f"deposit:{draft.source_type}",
-                "feishu_doc_token": write_result.document_token,
-                "wiki_node_token": write_result.wiki_node_token,
-            },
-        )
-        return DepositResult(
-            status="completed",
-            message="已完成沉淀，内容已写入飞书并加入本地知识库索引。",
-            draft=draft,
-            final_markdown=final_markdown,
-            local_document_id=ingest_result.document_id,
-            feishu_doc_token=write_result.document_token,
-            feishu_doc_url=write_result.document_url,
-            wiki_node_token=write_result.wiki_node_token,
-            metadata={"source_type": source.source_type, "auto_write": True},
-        )
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = (perf_counter() - started_at) * 1000
+            log_exception(
+                "deposit_failed",
+                exc,
+                text_preview=preview_text(normalized.text),
+                url_count=len(normalized.urls),
+                image_count=len(normalized.image_paths),
+                duration_ms=round(elapsed_ms, 1),
+            )
+            raise
 
     def _normalize_request(self, request: DepositRequest) -> DepositRequest:
         urls = list(request.urls)

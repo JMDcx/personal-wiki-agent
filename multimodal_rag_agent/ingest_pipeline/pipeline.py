@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from time import perf_counter
+
+try:
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from observability.events import log_event, log_exception
 
 from multimodal_rag_agent.models import ParsedDocument
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
@@ -114,6 +120,7 @@ class IngestPipeline:
         return results
 
     def _ingest_parsed(self, document_id: str, parsed, metadata: dict[str, object]) -> IngestResult:
+        started_at = perf_counter()
         document_metadata = dict(parsed.metadata)
         document_metadata.update(metadata)
         document_metadata.setdefault("document_id", document_id)
@@ -121,19 +128,46 @@ class IngestPipeline:
         document_metadata.setdefault("source_uri", document_metadata.get("source_uri", ""))
         document_metadata.setdefault("source_url", document_metadata.get("source_uri", ""))
         document_metadata.setdefault("source_type", "file" if document_metadata.get("source_uri", "") == "" else "url")
-        resolved = self.image_resolver.resolve(document_id, parsed)
-        text_chunks = self.chunker.split(document_id, resolved.markdown_content, document_metadata)
-        image_chunks = self.multimodal_pipeline.process_images(document_id, resolved.images, text_chunks, document_metadata)
-        all_chunks: list[ChunkRecord] = text_chunks + image_chunks
-        vectors = self.embedder.embed_texts([chunk.content for chunk in all_chunks]) if all_chunks else []
-        if all_chunks:
-            self.qdrant_index.upsert_chunks(all_chunks, vectors)
-        return IngestResult(
+        log_event(
+            "ingest_started",
             document_id=document_id,
-            status="completed",
-            chunk_count=len(all_chunks),
-            image_count=len(resolved.images),
-            resolved_markdown=resolved.markdown_content,
-            chunks=all_chunks,
-            images=resolved.images,
+            title=str(document_metadata.get("title", "Untitled Document")),
+            source_type=str(document_metadata.get("source_type", "")),
         )
+        try:
+            resolved = self.image_resolver.resolve(document_id, parsed)
+            text_chunks = self.chunker.split(document_id, resolved.markdown_content, document_metadata)
+            image_chunks = self.multimodal_pipeline.process_images(document_id, resolved.images, text_chunks, document_metadata)
+            all_chunks: list[ChunkRecord] = text_chunks + image_chunks
+            vectors = self.embedder.embed_texts([chunk.content for chunk in all_chunks]) if all_chunks else []
+            if all_chunks:
+                self.qdrant_index.upsert_chunks(all_chunks, vectors)
+            elapsed_ms = (perf_counter() - started_at) * 1000
+            log_event(
+                "ingest_completed",
+                document_id=document_id,
+                text_chunk_count=len(text_chunks),
+                image_chunk_count=len(image_chunks),
+                chunk_count=len(all_chunks),
+                image_count=len(resolved.images),
+                duration_ms=round(elapsed_ms, 1),
+            )
+            return IngestResult(
+                document_id=document_id,
+                status="completed",
+                chunk_count=len(all_chunks),
+                image_count=len(resolved.images),
+                resolved_markdown=resolved.markdown_content,
+                chunks=all_chunks,
+                images=resolved.images,
+            )
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = (perf_counter() - started_at) * 1000
+            log_exception(
+                "ingest_failed",
+                exc,
+                document_id=document_id,
+                title=str(document_metadata.get("title", "Untitled Document")),
+                duration_ms=round(elapsed_ms, 1),
+            )
+            raise

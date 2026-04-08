@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import atexit
 import json
-import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,8 +12,14 @@ from typing import Any
 
 try:
     from feishu_wiki_rag_agent.config import Settings, get_settings
+    from feishu_wiki_rag_agent.observability.context import bind_log_context, get_log_context
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception, preview_text
+    from feishu_wiki_rag_agent.observability.logging import configure_logging
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from config import Settings, get_settings
+    from observability.context import bind_log_context, get_log_context
+    from observability.events import log_event, log_exception, preview_text
+    from observability.logging import configure_logging
 
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
 from multimodal_rag_agent.rag_query_pipeline.pipeline import RAGQueryPipeline
@@ -51,9 +56,6 @@ except ModuleNotFoundError:  # pragma: no cover - imported lazily in tests
     ChatOpenAI = None  # type: ignore[assignment]
 
 
-logger = logging.getLogger(__name__)
-
-
 NON_RETRIEVAL_INTENTS = {
     "greeting",
     "summarize",
@@ -72,10 +74,7 @@ _CHECKPOINTER_CONTEXTS: dict[str, Any] = {}
 
 
 def _question_preview(text: str, limit: int = 80) -> str:
-    normalized = " ".join(text.split())
-    if len(normalized) <= limit:
-        return normalized
-    return f"{normalized[: limit - 3]}..."
+    return preview_text(text, limit=limit)
 
 
 @dataclass(slots=True)
@@ -348,14 +347,15 @@ def _build_controller_context(
         ),
     )
     elapsed_ms = (perf_counter() - started_at) * 1000
-    logger.info(
-        "[Timing] controller_context thread_id=%s intent=%s allow_retrieval=%s images=%s elapsed_ms=%.1f question=%r",
-        thread_id,
-        context.intent,
-        "yes" if allow_retrieval else "no",
-        len(images),
-        elapsed_ms,
-        _question_preview(question),
+    log_event(
+        "controller_context_built",
+        thread_id=thread_id,
+        intent=context.intent,
+        allow_retrieval=allow_retrieval,
+        image_count=len(images),
+        history_turn_count=len(history),
+        duration_ms=round(elapsed_ms, 1),
+        question_preview=_question_preview(question),
     )
     return context
 
@@ -368,15 +368,36 @@ def search_knowledge_tool_text(
 ) -> str:
     """Return prepared RAG context for the agent or fallback snippets when needed."""
     started_at = perf_counter()
-    resolved = settings or get_settings()
+    _ = settings or get_settings()
     rag_pipeline = pipeline or RAGQueryPipeline(get_multimodal_settings())
-    prepared = rag_pipeline.prepare_context(query, with_sources=True)
+    log_event(
+        "tool_called",
+        tool_name="search_feishu_knowledge",
+        query_preview=_question_preview(query),
+    )
+    try:
+        prepared = rag_pipeline.prepare_context(query, with_sources=True)
+    except Exception as exc:  # noqa: BLE001
+        elapsed_ms = (perf_counter() - started_at) * 1000
+        log_exception(
+            "tool_failed",
+            exc,
+            tool_name="search_feishu_knowledge",
+            duration_ms=round(elapsed_ms, 1),
+            query_preview=_question_preview(query),
+        )
+        raise
     if not prepared.merged_chunks:
         elapsed_ms = (perf_counter() - started_at) * 1000
-        logger.info(
-            "[Timing] search_knowledge empty_result elapsed_ms=%.1f query=%r",
-            elapsed_ms,
-            _question_preview(query),
+        log_event(
+            "tool_completed",
+            tool_name="search_feishu_knowledge",
+            success=True,
+            result_status="empty",
+            chunk_count=0,
+            source_count=0,
+            duration_ms=round(elapsed_ms, 1),
+            query_preview=_question_preview(query),
         )
         return "当前索引中未找到相关内容。"
 
@@ -390,12 +411,15 @@ def search_knowledge_tool_text(
         )
         lines.append(source_line)
     elapsed_ms = (perf_counter() - started_at) * 1000
-    logger.info(
-        "[Timing] search_knowledge chunks=%s sources=%s elapsed_ms=%.1f query=%r",
-        len(prepared.merged_chunks),
-        len(prepared.sources),
-        elapsed_ms,
-        _question_preview(query),
+    log_event(
+        "tool_completed",
+        tool_name="search_feishu_knowledge",
+        success=True,
+        result_status="completed",
+        chunk_count=len(prepared.merged_chunks),
+        source_count=len(prepared.sources),
+        duration_ms=round(elapsed_ms, 1),
+        query_preview=_question_preview(query),
     )
     return "\n\n".join(lines)
 
@@ -417,11 +441,37 @@ def deposit_knowledge_tool_text(
         image_paths = json.loads(image_paths_json) if image_paths_json.strip() else []
     except json.JSONDecodeError:
         image_paths = []
-    result = deposit_pipeline.run(
-        DepositRequest(
-            text=text,
-            image_paths=[str(path) for path in image_paths if str(path).strip()],
+    cleaned_image_paths = [str(path) for path in image_paths if str(path).strip()]
+    log_event(
+        "tool_called",
+        tool_name="deposit_to_feishu_knowledge",
+        text_preview=_question_preview(text),
+        image_count=len(cleaned_image_paths),
+    )
+    try:
+        result = deposit_pipeline.run(
+            DepositRequest(
+                text=text,
+                image_paths=cleaned_image_paths,
+            )
         )
+    except Exception as exc:  # noqa: BLE001
+        log_exception(
+            "tool_failed",
+            exc,
+            tool_name="deposit_to_feishu_knowledge",
+            text_preview=_question_preview(text),
+            image_count=len(cleaned_image_paths),
+        )
+        raise
+    log_event(
+        "tool_completed",
+        tool_name="deposit_to_feishu_knowledge",
+        success=True,
+        result_status=result.status,
+        source_type=result.draft.source_type,
+        local_document_id=result.local_document_id,
+        has_feishu_doc=bool(result.feishu_doc_url),
     )
     lines = [result.message, f"来源类型：{result.draft.source_type}"]
     if result.feishu_doc_url:
@@ -533,38 +583,63 @@ def invoke_agent(
     """Run the Deep Agent orchestrator backed by the multimodal RAG pipeline."""
     started_at = perf_counter()
     resolved = settings or get_settings()
+    configure_logging(resolved)
     multimodal_settings = get_multimodal_settings()
-    agent = _get_or_build_agent_runtime(resolved)
-    controller_context = _build_controller_context(
-        question=question,
-        thread_id=thread_id,
-        images=images or [],
-        language=language,
-        settings=resolved,
-        multimodal_settings=multimodal_settings,
-        agent_runtime=agent,
-    )
+    context_fields: dict[str, object] = {
+        "thread_id": thread_id,
+        "language": language,
+    }
+    if not get_log_context().get("request_id"):
+        context_fields["request_id"] = f"thread:{thread_id}"
 
-    messages: list[dict[str, Any]] = []
-    if controller_context.runtime_system_prompt:
-        messages.append({"role": "system", "content": controller_context.runtime_system_prompt})
-    messages.append({"role": "user", "content": controller_context.user_content})
+    with bind_log_context(**context_fields):
+        log_event(
+            "agent_invoke_started",
+            question_preview=_question_preview(question),
+            image_count=len(images or []),
+        )
+        try:
+            agent = _get_or_build_agent_runtime(resolved)
+            controller_context = _build_controller_context(
+                question=question,
+                thread_id=thread_id,
+                images=images or [],
+                language=language,
+                settings=resolved,
+                multimodal_settings=multimodal_settings,
+                agent_runtime=agent,
+            )
 
-    invoke_started_at = perf_counter()
-    result = agent.invoke(
-        {"messages": messages},
-        config={"configurable": {"thread_id": thread_id}},
-    )
-    invoke_elapsed_ms = (perf_counter() - invoke_started_at) * 1000
-    total_elapsed_ms = (perf_counter() - started_at) * 1000
-    final_text = extract_final_text(result)
-    logger.info(
-        "[Timing] agent_invoke thread_id=%s intent=%s invoke_elapsed_ms=%.1f total_elapsed_ms=%.1f answer_len=%s question=%r",
-        thread_id,
-        controller_context.intent,
-        invoke_elapsed_ms,
-        total_elapsed_ms,
-        len(final_text),
-        _question_preview(question),
-    )
-    return final_text
+            messages: list[dict[str, Any]] = []
+            if controller_context.runtime_system_prompt:
+                messages.append({"role": "system", "content": controller_context.runtime_system_prompt})
+            messages.append({"role": "user", "content": controller_context.user_content})
+
+            invoke_started_at = perf_counter()
+            result = agent.invoke(
+                {"messages": messages},
+                config={"configurable": {"thread_id": thread_id}},
+            )
+            invoke_elapsed_ms = (perf_counter() - invoke_started_at) * 1000
+            total_elapsed_ms = (perf_counter() - started_at) * 1000
+            final_text = extract_final_text(result)
+            log_event(
+                "agent_invoke_completed",
+                intent=controller_context.intent,
+                invoke_duration_ms=round(invoke_elapsed_ms, 1),
+                total_duration_ms=round(total_elapsed_ms, 1),
+                answer_length=len(final_text),
+                answer_preview=_question_preview(final_text),
+                question_preview=_question_preview(question),
+            )
+            return final_text
+        except Exception as exc:  # noqa: BLE001
+            total_elapsed_ms = (perf_counter() - started_at) * 1000
+            log_exception(
+                "request_failed",
+                exc,
+                stage="agent_invoke",
+                total_duration_ms=round(total_elapsed_ms, 1),
+                question_preview=_question_preview(question),
+            )
+            raise

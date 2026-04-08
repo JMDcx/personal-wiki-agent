@@ -16,11 +16,17 @@ try:
     from feishu_wiki_rag_agent.agent import invoke_agent
     from feishu_wiki_rag_agent.config import Settings, get_settings
     from feishu_wiki_rag_agent.channel.feishu.feishu_client import FeishuClient
+    from feishu_wiki_rag_agent.observability.context import bind_log_context
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception, preview_text
+    from feishu_wiki_rag_agent.observability.logging import configure_logging
     from feishu_wiki_rag_agent.schemas import IncomingMessage
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from agent import invoke_agent
     from config import Settings, get_settings
     from channel.feishu.feishu_client import FeishuClient
+    from observability.context import bind_log_context
+    from observability.events import log_event, log_exception, preview_text
+    from observability.logging import configure_logging
     from schemas import IncomingMessage
 
 LARK_SDK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
@@ -76,6 +82,7 @@ class FeishuChannel:
 
     def run(self) -> None:
         """Start the websocket client and listen for Feishu messages."""
+        configure_logging(self.settings)
         if self.settings.feishu_event_mode != "websocket":
             msg = "This example only supports FEISHU_EVENT_MODE=websocket."
             raise RuntimeError(msg)
@@ -114,9 +121,34 @@ class FeishuChannel:
             return None
 
         thread_id = f"feishu:{incoming.chat_id}"
-        answer = self.agent_runner(incoming.text, thread_id)
-        self.client.reply_text(incoming.message_id, answer)
-        return answer
+        request_id = f"feishu:{incoming.message_id}"
+        with bind_log_context(
+            request_id=request_id,
+            thread_id=thread_id,
+            channel="feishu",
+            message_id=incoming.message_id,
+            chat_id=incoming.chat_id,
+        ):
+            log_event(
+                "message_normalized",
+                chat_type=incoming.chat_type,
+                sender_open_id=incoming.sender_open_id,
+                mention_count=len(incoming.mentions),
+                text_preview=preview_text(incoming.text),
+            )
+            try:
+                answer = self.agent_runner(incoming.text, thread_id)
+                self.client.reply_text(incoming.message_id, answer)
+                log_event(
+                    "reply_sent",
+                    reply_channel="feishu",
+                    answer_length=len(answer),
+                    answer_preview=preview_text(answer),
+                )
+                return answer
+            except Exception as exc:  # noqa: BLE001
+                log_exception("request_failed", exc, stage="feishu_channel_handle_event")
+                raise
 
     def _parse_incoming_message(self, event: dict) -> IncomingMessage | None:
         """Convert a raw Feishu event into the local message schema."""
@@ -128,30 +160,47 @@ class FeishuChannel:
         message_id = str(message.get("message_id", ""))
         if not message_id or not self.deduper.should_process(message_id):
             return None
-
-        content = json.loads(message.get("content", "{}"))
-        text = str(content.get("text", "")).strip()
-        mentions = message.get("mentions", [])
-        chat_type = str(message.get("chat_type", ""))
-
-        if chat_type == "group":
-            if not mentions:
-                return None
-            if not self._mentions_bot(mentions):
-                return None
-            text = re.sub(r"@_user_\d+\s*", "", text).strip()
-
-        if not text:
-            return None
-
-        return IncomingMessage(
+        chat_id = str(message.get("chat_id", ""))
+        thread_id = f"feishu:{chat_id}" if chat_id else ""
+        with bind_log_context(
+            request_id=f"feishu:{message_id}",
+            thread_id=thread_id,
+            channel="feishu",
             message_id=message_id,
-            chat_id=str(message.get("chat_id", "")),
-            chat_type=chat_type,
-            sender_open_id=str(sender.get("sender_id", {}).get("open_id", "")),
-            text=text,
-            mentions=mentions,
-        )
+            chat_id=chat_id,
+        ):
+            log_event(
+                "message_received",
+                message_type=str(message.get("message_type", "")),
+                chat_type=str(message.get("chat_type", "")),
+            )
+
+            content = json.loads(message.get("content", "{}"))
+            text = str(content.get("text", "")).strip()
+            mentions = message.get("mentions", [])
+            chat_type = str(message.get("chat_type", ""))
+
+            if chat_type == "group":
+                if not mentions:
+                    log_event("message_ignored", reason="group_without_mentions")
+                    return None
+                if not self._mentions_bot(mentions):
+                    log_event("message_ignored", reason="group_not_mentioning_bot")
+                    return None
+                text = re.sub(r"@_user_\d+\s*", "", text).strip()
+
+            if not text:
+                log_event("message_ignored", reason="empty_text_after_normalization")
+                return None
+
+            return IncomingMessage(
+                message_id=message_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                sender_open_id=str(sender.get("sender_id", {}).get("open_id", "")),
+                text=text,
+                mentions=mentions,
+            )
 
     def _mentions_bot(self, mentions: list[dict]) -> bool:
         """Return whether the incoming group message mentioned the current bot."""
@@ -162,9 +211,10 @@ class FeishuChannel:
 
 def main() -> None:
     """Load env vars and run the Feishu websocket channel."""
-    logging.basicConfig(level=logging.INFO)
     load_dotenv(Settings().env_path)
-    FeishuChannel().run()
+    settings = get_settings()
+    configure_logging(settings)
+    FeishuChannel(settings=settings).run()
 
 
 if __name__ == "__main__":
