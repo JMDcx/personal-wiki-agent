@@ -43,6 +43,7 @@ packages = [
     "multimodal_rag_agent",
     "multimodal_rag_agent.api",
     "multimodal_rag_agent.docreader_service",
+    "multimodal_rag_agent.deposit_pipeline",
     "multimodal_rag_agent.image_resolver",
     "multimodal_rag_agent.ingest_pipeline",
     "multimodal_rag_agent.multimodal_image_pipeline",

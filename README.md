@@ -12,11 +12,13 @@ This project indexes Feishu Wiki and Docs content into Qdrant and answers user q
 - Personal Weixin integration over the official iLink bot API
 - Deep Agents runtime as the main orchestration layer
 - Dedicated retrieval subagent for documentation questions
+- Dedicated knowledge-deposit flow for external links, text, and images
 - Feishu Wiki and Docs ingestion into Qdrant
 - Multimodal RAG pipeline for retrieval, rerank, merge, and answer generation
 - Separate chat-model and embedding-model provider configuration
 - Optional image OCR / caption indexing pipeline for multimodal content
 - Weixin attachment adaptation for text, links, images, and files
+- Xiaohongshu post retrieval through a locally running MCP service
 - Local `AGENTS.md` memory and `SKILL.md` guidance for answer behavior
 - Source-aware answers that can cite the indexed document title or link
 
@@ -41,6 +43,14 @@ The indexing flow is:
 4. Generate embeddings
 5. Persist the index in Qdrant
 6. Write an index manifest to `data/index_manifest.json`
+
+The knowledge-deposit flow is:
+
+1. Detect whether the user wants to save content into the knowledge base
+2. Fetch source material from Xiaohongshu, generic URLs, plain text, or images
+3. Normalize the source into a markdown draft
+4. Optionally write the final draft into Feishu Docs / Wiki
+5. Ingest the final markdown into the local Qdrant index
 
 ## Project Layout
 
@@ -74,9 +84,16 @@ feishu_wiki_rag_agent/
 ├── pyproject.toml
 ├── retrieval.py
 ├── schemas.py
+├── scripts/
+│   └── verify_xhs_deposit.py
 ├── skills/
 │   └── knowledge-qa/
 │       └── SKILL.md
+│   └── knowledge-deposit/
+│       └── SKILL.md
+├── tools/
+│   └── xiaohongshu-bin/
+│       └── README.md
 ├── tests/
 │   ├── test_agent_controller_flow.py
 │   ├── test_query_understand_service.py
@@ -158,6 +175,11 @@ MULTIMODAL_RAG_TOP_K=6
 MULTIMODAL_RAG_RERANK_TOP_K=4
 MULTIMODAL_RAG_CHUNK_SIZE=512
 MULTIMODAL_RAG_CHUNK_OVERLAP=128
+
+FEISHU_DEPOSIT_SPACE_ID=
+FEISHU_DEPOSIT_PARENT_NODE_TOKEN=
+DEPOSIT_ENABLE_AUTO_WRITE=true
+XHS_MCP_URL=http://127.0.0.1:18060/mcp
 ```
 
 If you prefer one provider for both chat and embeddings, you can use:
@@ -170,6 +192,63 @@ The example-specific variables still take precedence when present.
 If you already have a valid Weixin iLink token, you can also set:
 
 - `WEIXIN_TOKEN`
+
+## Xiaohongshu MCP Setup
+
+This project expects Xiaohongshu post retrieval to come from a locally running MCP service.
+
+Recommended layout:
+
+1. Put the upstream macOS binaries in [tools/xiaohongshu-bin/README.md](/Users/jmdcx/Documents/GitHub/feishu-wiki-rag-agent/tools/xiaohongshu-bin/README.md):
+   - `xiaohongshu-mcp-darwin-arm64`
+   - `xiaohongshu-login-darwin-arm64`
+2. Make them executable:
+
+```bash
+chmod +x tools/xiaohongshu-bin/xiaohongshu-*-darwin-arm64
+```
+
+3. Log in with the upstream login binary:
+
+```bash
+./tools/xiaohongshu-bin/xiaohongshu-login-darwin-arm64
+```
+
+4. Start the local MCP service:
+
+```bash
+./tools/xiaohongshu-bin/xiaohongshu-mcp-darwin-arm64
+```
+
+5. Keep `.env` pointed at the local service:
+
+```env
+XHS_MCP_URL=http://127.0.0.1:18060/mcp
+```
+
+The local binary approach is the current recommended setup in this repository. The earlier Docker experiment is no longer part of the documented workflow.
+
+## Knowledge Deposit
+
+The agent can now handle requests such as:
+
+- `把这个小红书链接沉淀到知识库`
+- `把这段文本沉淀到知识库`
+- `把这张图片沉淀到知识库`
+
+When the source is Xiaohongshu, the runtime will call the local MCP service, normalize the note details, and build a structured knowledge draft.
+
+To verify the MCP connection and the local deposit pipeline:
+
+```bash
+python scripts/verify_xhs_deposit.py --url "https://www.xiaohongshu.com/explore/xxx?xsec_token=yyy"
+```
+
+By default this runs in preview mode and does not write to Feishu. To enable full write-back, configure:
+
+- `FEISHU_DEPOSIT_SPACE_ID`
+- `FEISHU_DEPOSIT_PARENT_NODE_TOKEN`
+- `DEPOSIT_ENABLE_AUTO_WRITE=true`
 
 ## Feishu Setup
 

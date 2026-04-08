@@ -18,3 +18,6 @@ __pycache__/
 htmlcov/
 
 .DS_Store
+cookies.json
+scripts/__pycache__/
+tools/xiaohongshu-bin/xiaohongshu-*-darwin-arm64

@@ -12,15 +12,21 @@ from typing import Callable
 
 from dotenv import load_dotenv
 
-from feishu_wiki_rag_agent.agent import invoke_agent
-from feishu_wiki_rag_agent.channel.weixin.weixin_api import (
-    CDN_BASE_URL,
-    DEFAULT_BASE_URL,
-    WeixinApi,
-)
-from feishu_wiki_rag_agent.channel.weixin.weixin_api import download_media_from_cdn
-from feishu_wiki_rag_agent.channel.weixin.weixin_message import DownloadedAttachment, WeixinMessage
-from feishu_wiki_rag_agent.config import Settings, get_settings
+try:
+    from feishu_wiki_rag_agent.agent import invoke_agent
+    from feishu_wiki_rag_agent.channel.weixin.weixin_api import (
+        CDN_BASE_URL,
+        DEFAULT_BASE_URL,
+        WeixinApi,
+    )
+    from feishu_wiki_rag_agent.channel.weixin.weixin_api import download_media_from_cdn
+    from feishu_wiki_rag_agent.channel.weixin.weixin_message import DownloadedAttachment, WeixinMessage
+    from feishu_wiki_rag_agent.config import Settings, get_settings
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from agent import invoke_agent
+    from channel.weixin.weixin_api import CDN_BASE_URL, DEFAULT_BASE_URL, WeixinApi, download_media_from_cdn
+    from channel.weixin.weixin_message import DownloadedAttachment, WeixinMessage
+    from config import Settings, get_settings
 from multimodal_rag_agent.docreader_service.client import DocreaderService
 from multimodal_rag_agent.docreader_service.schemas import ParseRequest
 from multimodal_rag_agent.models import ImageRef, ParsedDocument

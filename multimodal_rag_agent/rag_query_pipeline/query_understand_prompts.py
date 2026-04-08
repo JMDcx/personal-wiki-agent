@@ -25,11 +25,12 @@ Follow the decision priority below from top to bottom and stop at the first matc
 1. greeting - Pure greetings, thanks, or farewell with NO substantive question
 2. summarize - The user asks to summarize, organize, or review the conversation itself
 3. web_search - The question explicitly asks for real-time, latest, or external information
-4. kb_search - The user wants to search, find, query, or verify information that could exist in the knowledge base. This applies even when images are attached
-5. clarification - The question is ambiguous or incomplete and likely needs KB retrieval
-6. follow_up - The question clearly refers to previous conversation content and can be fully answered from dialogue history alone, with no new retrieval
-7. image_only - The user only wants to understand, describe, translate, or extract content from the attached image itself, with no external search intent
-8. chitchat - Casual conversation or small talk that needs no retrieval
+4. knowledge_deposit - The user explicitly asks to save, archive, ingest, collect, or 沉淀 provided links, text, or images into the knowledge base
+5. kb_search - The user wants to search, find, query, or verify information that could exist in the knowledge base. This applies even when images are attached
+6. clarification - The question is ambiguous or incomplete and likely needs KB retrieval
+7. follow_up - The question clearly refers to previous conversation content and can be fully answered from dialogue history alone, with no new retrieval
+8. image_only - The user only wants to understand, describe, translate, or extract content from the attached image itself, with no external search intent
+9. chitchat - Casual conversation or small talk that needs no retrieval
 
 Default: when unsure, always choose kb_search.
 

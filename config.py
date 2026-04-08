@@ -89,6 +89,14 @@ class Settings:
     rag_top_k: int = field(default_factory=lambda: int(os.getenv("FEISHU_RAG_TOP_K", "4")))
     embedding_model: str = field(default_factory=lambda: os.getenv("FEISHU_RAG_EMBEDDING_MODEL", "text-embedding-3-small"))
     manifest_name: str = field(default_factory=lambda: os.getenv("FEISHU_RAG_MANIFEST", "index_manifest.json"))
+    feishu_deposit_space_id: str = field(default_factory=lambda: os.getenv("FEISHU_DEPOSIT_SPACE_ID", ""))
+    feishu_deposit_parent_node_token: str = field(
+        default_factory=lambda: os.getenv("FEISHU_DEPOSIT_PARENT_NODE_TOKEN", "")
+    )
+    xhs_mcp_url: str = field(default_factory=lambda: os.getenv("XHS_MCP_URL", "http://127.0.0.1:18060/mcp"))
+    deposit_enable_auto_write: bool = field(
+        default_factory=lambda: os.getenv("DEPOSIT_ENABLE_AUTO_WRITE", "true").strip().lower() not in {"0", "false", "no"}
+    )
 
     def ensure_directories(self) -> None:
         """Create local directories used by the example."""

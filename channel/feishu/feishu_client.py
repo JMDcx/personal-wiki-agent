@@ -10,7 +10,10 @@ from typing import Any
 
 import requests
 
-from feishu_wiki_rag_agent.config import Settings, get_settings
+try:
+    from feishu_wiki_rag_agent.config import Settings, get_settings
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from config import Settings, get_settings
 
 try:
     from langchain_core.documents import Document

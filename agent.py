@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from time import perf_counter
@@ -27,6 +29,8 @@ from multimodal_rag_agent.rag_query_pipeline.query_understand_service import (
     QueryUnderstandResult,
     QueryUnderstandService,
 )
+from multimodal_rag_agent.deposit_pipeline.models import DepositRequest
+from multimodal_rag_agent.deposit_pipeline.pipeline import DepositPipeline
 
 try:
     from langchain_core.messages import AIMessage
@@ -57,7 +61,10 @@ NON_RETRIEVAL_INTENTS = {
     "follow_up",
     "image_only",
     "chitchat",
+    "knowledge_deposit",
 }
+
+DEPOSIT_TRIGGER_PATTERN = re.compile(r"(沉淀到知识库|沉淀到库|保存到知识库|收录到知识库|入库|沉淀一下|归档到知识库)")
 
 _AGENT_RUNTIME_CACHE: dict[tuple[str, str, str, str], Any] = {}
 _CHECKPOINTER_CACHE: dict[str, Any] = {}
@@ -309,12 +316,20 @@ def _build_controller_context(
         chat_model_supports_vision=chat_model_supports_vision,
         vlm_model=_build_vlm_model_config(multimodal_settings),
     )
+    if _is_knowledge_deposit_request(question):
+        understand_result = QueryUnderstandResult(
+            rewrite_query=question.strip(),
+            intent="knowledge_deposit",
+            image_description=understand_result.image_description,
+            raw_output=understand_result.raw_output,
+        )
     allow_retrieval = _intent_requires_retrieval(understand_result.intent)
     user_content = render_controller_user_input(
         question=question,
         understand_result=understand_result,
         history=history,
         allow_retrieval=allow_retrieval,
+        images=images,
     )
     current_time = datetime.now().isoformat(timespec="seconds")
     context = ControllerInputContext(
@@ -385,6 +400,37 @@ def search_knowledge_tool_text(
     return "\n\n".join(lines)
 
 
+def _is_knowledge_deposit_request(text: str) -> bool:
+    return bool(DEPOSIT_TRIGGER_PATTERN.search(text or ""))
+
+
+def deposit_knowledge_tool_text(
+    text: str,
+    *,
+    image_paths_json: str = "[]",
+    settings: Settings | None = None,
+    pipeline: DepositPipeline | None = None,
+) -> str:
+    resolved = settings or get_settings()
+    deposit_pipeline = pipeline or DepositPipeline(resolved, get_multimodal_settings())
+    try:
+        image_paths = json.loads(image_paths_json) if image_paths_json.strip() else []
+    except json.JSONDecodeError:
+        image_paths = []
+    result = deposit_pipeline.run(
+        DepositRequest(
+            text=text,
+            image_paths=[str(path) for path in image_paths if str(path).strip()],
+        )
+    )
+    lines = [result.message, f"来源类型：{result.draft.source_type}"]
+    if result.feishu_doc_url:
+        lines.append(f"飞书文档：{result.feishu_doc_url}")
+    if result.wiki_node_token:
+        lines.append(f"Wiki 节点：{result.wiki_node_token}")
+    return "\n".join(lines)
+
+
 def _build_chat_model(settings: Settings) -> Any:
     if ChatOpenAI is None:  # pragma: no cover - local fallback
         msg = "langchain_openai is required to run the Deep Agent runtime."
@@ -400,7 +446,9 @@ def _build_chat_model(settings: Settings) -> Any:
 def build_agent(settings: Settings | None = None) -> Any:
     """Build the Deep Agent runtime with a dedicated retrieval subagent."""
     resolved = settings or get_settings()
-    rag_pipeline = RAGQueryPipeline(get_multimodal_settings())
+    multimodal_settings = get_multimodal_settings()
+    rag_pipeline = RAGQueryPipeline(multimodal_settings)
+    deposit_pipeline = DepositPipeline(resolved, multimodal_settings)
 
     from deepagents import create_deep_agent
     from deepagents.backends import FilesystemBackend
@@ -410,6 +458,16 @@ def build_agent(settings: Settings | None = None) -> Any:
     def search_feishu_knowledge(query: str) -> str:
         """Retrieve relevant Feishu knowledge snippets and sources for a query."""
         return search_knowledge_tool_text(query, resolved, pipeline=rag_pipeline)
+
+    @tool
+    def deposit_to_feishu_knowledge(text: str, image_paths_json: str = "[]") -> str:
+        """Deposit provided links, text, or images into the Feishu knowledge base and local index."""
+        return deposit_knowledge_tool_text(
+            text,
+            image_paths_json=image_paths_json,
+            settings=resolved,
+            pipeline=deposit_pipeline,
+        )
 
     return create_deep_agent(
         name="feishu-wiki-rag-agent",
@@ -425,6 +483,18 @@ def build_agent(settings: Settings | None = None) -> Any:
                     "Return concise retrieval findings, likely sources, and note when nothing relevant was found."
                 ),
                 "tools": [search_feishu_knowledge],
+                "skills": ["/skills/"],
+            },
+            {
+                "name": "knowledge_depositor",
+                "description": "Deposit external links, text, and images into the Feishu knowledge base.",
+                "system_prompt": (
+                    "You are a knowledge deposit specialist. "
+                    "Always call `deposit_to_feishu_knowledge` before responding. "
+                    "Use the user's full source text, and pass image_paths_json when runtime metadata contains image paths. "
+                    "Return a concise completion note with the resulting document link when available."
+                ),
+                "tools": [deposit_to_feishu_knowledge],
                 "skills": ["/skills/"],
             }
         ],

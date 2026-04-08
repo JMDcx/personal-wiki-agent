@@ -12,11 +12,13 @@
 - 基于官方 iLink bot API 的个人微信接入
 - 以 Deep Agents runtime 作为主编排层
 - 面向文档类问题的专用检索子 agent
+- 面向外部链接、文本、图片的知识沉淀链路
 - 将飞书 Wiki 和 Docs 内容写入 Qdrant
 - 包含检索、重排、合并和答案生成的多模态 RAG 流水线
 - 聊天模型和 embedding 模型可分别配置不同 provider
 - 可选的图片 OCR / caption 索引流水线，用于处理多模态内容
 - 微信文本、链接、图片、文件输入适配
+- 通过本地运行的 Xiaohongshu MCP 服务抓取小红书帖子详情
 - 使用本地 `AGENTS.md` 记忆和 `SKILL.md` 规范回答行为
 - 具备来源感知能力，回答中可以引用已索引文档的标题或链接
 
@@ -41,6 +43,14 @@
 4. 生成 embedding
 5. 将索引持久化到 Qdrant
 6. 将索引清单写入 `data/index_manifest.json`
+
+知识沉淀链路如下：
+
+1. 识别用户是否在明确要求“沉淀到知识库”
+2. 从小红书、普通链接、纯文本或图片中提取原始材料
+3. 规范化为统一的 markdown 知识稿
+4. 按配置选择是否写回飞书 Doc / Wiki
+5. 将最终 markdown 写入本地 Qdrant 索引
 
 ## 项目结构
 
@@ -74,9 +84,16 @@ feishu_wiki_rag_agent/
 ├── pyproject.toml
 ├── retrieval.py
 ├── schemas.py
+├── scripts/
+│   └── verify_xhs_deposit.py
 ├── skills/
 │   └── knowledge-qa/
 │       └── SKILL.md
+│   └── knowledge-deposit/
+│       └── SKILL.md
+├── tools/
+│   └── xiaohongshu-bin/
+│       └── README.md
 ├── tests/
 │   ├── test_agent_controller_flow.py
 │   ├── test_query_understand_service.py
@@ -158,6 +175,11 @@ MULTIMODAL_RAG_TOP_K=6
 MULTIMODAL_RAG_RERANK_TOP_K=4
 MULTIMODAL_RAG_CHUNK_SIZE=512
 MULTIMODAL_RAG_CHUNK_OVERLAP=128
+
+FEISHU_DEPOSIT_SPACE_ID=
+FEISHU_DEPOSIT_PARENT_NODE_TOKEN=
+DEPOSIT_ENABLE_AUTO_WRITE=true
+XHS_MCP_URL=http://127.0.0.1:18060/mcp
 ```
 
 如果你希望聊天和 embedding 共用同一个 provider，也可以使用：
@@ -170,6 +192,63 @@ MULTIMODAL_RAG_CHUNK_OVERLAP=128
 如果你已经拿到了可复用的 Weixin iLink token，也可以直接设置：
 
 - `WEIXIN_TOKEN`
+
+## 小红书 MCP 部署
+
+当前仓库推荐使用“本机 macOS 二进制 + 本地 MCP 服务”的方式接入小红书。
+
+推荐目录结构：
+
+1. 将上游二进制放到 [tools/xiaohongshu-bin/README.md](/Users/jmdcx/Documents/GitHub/feishu-wiki-rag-agent/tools/xiaohongshu-bin/README.md) 所在目录：
+   - `xiaohongshu-mcp-darwin-arm64`
+   - `xiaohongshu-login-darwin-arm64`
+2. 赋予执行权限：
+
+```bash
+chmod +x tools/xiaohongshu-bin/xiaohongshu-*-darwin-arm64
+```
+
+3. 先运行登录二进制：
+
+```bash
+./tools/xiaohongshu-bin/xiaohongshu-login-darwin-arm64
+```
+
+4. 再启动本地 MCP 服务：
+
+```bash
+./tools/xiaohongshu-bin/xiaohongshu-mcp-darwin-arm64
+```
+
+5. 保持 `.env` 中的地址指向本地服务：
+
+```env
+XHS_MCP_URL=http://127.0.0.1:18060/mcp
+```
+
+当前仓库已经不再把之前的 Docker 试验方案作为推荐部署方式。
+
+## 知识沉淀使用方式
+
+当前 agent 支持类似下面的请求：
+
+- `把这个小红书链接沉淀到知识库`
+- `把这段文本沉淀到知识库`
+- `把这张图片沉淀到知识库`
+
+当来源是小红书时，运行时会调用本地 MCP 服务抓取帖子详情，再生成结构化知识稿。
+
+如果你想验证 Xiaohongshu MCP 和本地沉淀链路是否通畅，可以运行：
+
+```bash
+python scripts/verify_xhs_deposit.py --url "https://www.xiaohongshu.com/explore/xxx?xsec_token=yyy"
+```
+
+默认只做 preview，不写回飞书。如果要走完整写入，请配置：
+
+- `FEISHU_DEPOSIT_SPACE_ID`
+- `FEISHU_DEPOSIT_PARENT_NODE_TOKEN`
+- `DEPOSIT_ENABLE_AUTO_WRITE=true`
 
 ## 飞书配置
 

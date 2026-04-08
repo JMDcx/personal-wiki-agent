@@ -8,7 +8,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from feishu_wiki_rag_agent.channel.weixin.weixin_api import CDN_BASE_URL, download_media_from_cdn
+try:
+    from feishu_wiki_rag_agent.channel.weixin.weixin_api import CDN_BASE_URL, download_media_from_cdn
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from channel.weixin.weixin_api import CDN_BASE_URL, download_media_from_cdn
 
 
 ITEM_TEXT = 1

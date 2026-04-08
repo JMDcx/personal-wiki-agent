@@ -11,6 +11,7 @@ def render_controller_user_input(
     understand_result: QueryUnderstandResult,
     history: list[HistoryTurn],
     allow_retrieval: bool,
+    images: list[str] | None = None,
 ) -> str:
     lines: list[str] = [
         "[Runtime Metadata - for assistant control, not for direct user display]",
@@ -26,6 +27,8 @@ def render_controller_user_input(
                 understand_result.image_description,
             ]
         )
+    if images:
+        lines.extend(["image_paths:", *images])
 
     if history:
         lines.append("recent_history:")
