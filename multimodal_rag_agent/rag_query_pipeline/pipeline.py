@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from time import perf_counter
 
 try:
+    from feishu_wiki_rag_agent.observability.context import record_request_timing, update_request_state
     from feishu_wiki_rag_agent.observability.events import log_event, log_exception, preview_text
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from observability.context import record_request_timing, update_request_state
     from observability.events import log_event, log_exception, preview_text
 
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
@@ -89,6 +91,14 @@ class RAGQueryPipeline:
                         }
                     )
             elapsed_ms = (perf_counter() - started_at) * 1000
+            record_request_timing("retrieval_ms", elapsed_ms)
+            update_request_state(
+                candidate_count=len(retrieved),
+                reranked_count=len(reranked),
+                merged_count=len(merged),
+                source_count=len(sources),
+                retrieval_query_preview=preview_text(query_bundle.rewritten_query),
+            )
             log_event(
                 "retrieval_completed",
                 query_preview=preview_text(query_bundle.rewritten_query),

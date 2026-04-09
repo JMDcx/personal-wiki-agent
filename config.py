@@ -19,6 +19,22 @@ def _split_csv_env(name: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    """Parse a boolean environment variable with a caller-supplied default."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _default_log_include_tracebacks() -> bool:
+    """Include tracebacks by default only when explicitly requested or in debug mode."""
+    raw = os.getenv("FEISHU_LOG_INCLUDE_TRACEBACKS")
+    if raw is not None:
+        return _bool_env("FEISHU_LOG_INCLUDE_TRACEBACKS", False)
+    return os.getenv("FEISHU_LOG_LEVEL", "INFO").strip().upper() == "DEBUG"
+
+
 @dataclass
 class Settings:
     """Runtime settings for the Feishu Wiki RAG example."""
@@ -80,6 +96,20 @@ class Settings:
     )
     log_max_bytes: int = field(default_factory=lambda: int(os.getenv("FEISHU_LOG_MAX_BYTES", "10485760")))
     log_backup_count: int = field(default_factory=lambda: int(os.getenv("FEISHU_LOG_BACKUP_COUNT", "5")))
+    log_service_name: str = field(
+        default_factory=lambda: os.getenv("FEISHU_LOG_SERVICE_NAME", "feishu_wiki_rag_agent")
+    )
+    log_include_tracebacks: bool = field(default_factory=_default_log_include_tracebacks)
+    log_console_level: str = field(default_factory=lambda: os.getenv("FEISHU_LOG_CONSOLE_LEVEL", "INFO"))
+    log_json_level: str = field(default_factory=lambda: os.getenv("FEISHU_LOG_JSON_LEVEL", "INFO"))
+    log_httpx_level: str = field(default_factory=lambda: os.getenv("FEISHU_LOG_HTTPX_LEVEL", "WARNING"))
+    log_openai_level: str = field(default_factory=lambda: os.getenv("FEISHU_LOG_OPENAI_LEVEL", "WARNING"))
+    log_lark_level: str = field(default_factory=lambda: os.getenv("FEISHU_LOG_LARK_LEVEL", "ERROR"))
+    log_suppress_noisy_lark_events: bool = field(
+        default_factory=lambda: _bool_env("FEISHU_LOG_SUPPRESS_NOISY_LARK_EVENTS", True)
+    )
+    log_preview_length: int = field(default_factory=lambda: int(os.getenv("FEISHU_LOG_PREVIEW_LENGTH", "120")))
+    log_redact_previews: bool = field(default_factory=lambda: _bool_env("FEISHU_LOG_REDACT_PREVIEWS", False))
     chat_api_key: str = field(default_factory=lambda: os.getenv(
         "FEISHU_RAG_CHAT_API_KEY",
         os.getenv("OPENAI_API_KEY", ""),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,13 +13,27 @@ from typing import Any
 
 try:
     from feishu_wiki_rag_agent.config import Settings, get_settings
-    from feishu_wiki_rag_agent.observability.context import bind_log_context, get_log_context
-    from feishu_wiki_rag_agent.observability.events import log_event, log_exception, preview_text
+    from feishu_wiki_rag_agent.observability.context import (
+        bind_log_context,
+        bind_request_context,
+        get_log_context,
+        has_request_state,
+        record_request_timing,
+        update_request_state,
+    )
+    from feishu_wiki_rag_agent.observability.events import emit_request_summary, log_event, log_exception, preview_text
     from feishu_wiki_rag_agent.observability.logging import configure_logging
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from config import Settings, get_settings
-    from observability.context import bind_log_context, get_log_context
-    from observability.events import log_event, log_exception, preview_text
+    from observability.context import (
+        bind_log_context,
+        bind_request_context,
+        get_log_context,
+        has_request_state,
+        record_request_timing,
+        update_request_state,
+    )
+    from observability.events import emit_request_summary, log_event, log_exception, preview_text
     from observability.logging import configure_logging
 
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
@@ -347,6 +362,14 @@ def _build_controller_context(
         ),
     )
     elapsed_ms = (perf_counter() - started_at) * 1000
+    record_request_timing("intent_ms", elapsed_ms)
+    update_request_state(
+        intent=context.intent,
+        allow_retrieval=allow_retrieval,
+        question_preview=_question_preview(question),
+        history_turn_count=len(history),
+        image_count=len(images),
+    )
     log_event(
         "controller_context_built",
         thread_id=thread_id,
@@ -581,7 +604,6 @@ def invoke_agent(
     language: str = "中文",
 ) -> str:
     """Run the Deep Agent orchestrator backed by the multimodal RAG pipeline."""
-    started_at = perf_counter()
     resolved = settings or get_settings()
     configure_logging(resolved)
     multimodal_settings = get_multimodal_settings()
@@ -592,7 +614,10 @@ def invoke_agent(
     if not get_log_context().get("request_id"):
         context_fields["request_id"] = f"thread:{thread_id}"
 
-    with bind_log_context(**context_fields):
+    owns_request_state = not has_request_state()
+    context_manager = bind_request_context if owns_request_state else bind_log_context
+
+    with context_manager(**context_fields):
         log_event(
             "agent_invoke_started",
             question_preview=_question_preview(question),
@@ -621,25 +646,38 @@ def invoke_agent(
                 config={"configurable": {"thread_id": thread_id}},
             )
             invoke_elapsed_ms = (perf_counter() - invoke_started_at) * 1000
-            total_elapsed_ms = (perf_counter() - started_at) * 1000
+            record_request_timing("llm_ms", invoke_elapsed_ms)
             final_text = extract_final_text(result)
+            update_request_state(
+                intent=controller_context.intent,
+                allow_retrieval=_intent_requires_retrieval(controller_context.intent),
+                answer_length=len(final_text),
+                answer_preview=_question_preview(final_text),
+                question_preview=_question_preview(question),
+                language=language,
+            )
             log_event(
                 "agent_invoke_completed",
                 intent=controller_context.intent,
                 invoke_duration_ms=round(invoke_elapsed_ms, 1),
-                total_duration_ms=round(total_elapsed_ms, 1),
                 answer_length=len(final_text),
                 answer_preview=_question_preview(final_text),
                 question_preview=_question_preview(question),
             )
+            if owns_request_state:
+                emit_request_summary(status="ok")
             return final_text
         except Exception as exc:  # noqa: BLE001
-            total_elapsed_ms = (perf_counter() - started_at) * 1000
-            log_exception(
-                "request_failed",
-                exc,
-                stage="agent_invoke",
-                total_duration_ms=round(total_elapsed_ms, 1),
+            update_request_state(
                 question_preview=_question_preview(question),
+                language=language,
             )
+            if owns_request_state:
+                log_exception(
+                    "request_failed",
+                    exc,
+                    stage="agent_invoke",
+                    question_preview=_question_preview(question),
+                )
+                emit_request_summary(status="error", level=logging.ERROR)
             raise
