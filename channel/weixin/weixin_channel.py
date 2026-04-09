@@ -22,17 +22,20 @@ try:
     from feishu_wiki_rag_agent.channel.weixin.weixin_api import download_media_from_cdn
     from feishu_wiki_rag_agent.channel.weixin.weixin_message import DownloadedAttachment, WeixinMessage
     from feishu_wiki_rag_agent.config import Settings, get_settings
+    from feishu_wiki_rag_agent.observability.context import bind_log_context
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception, preview_text
+    from feishu_wiki_rag_agent.observability.logging import configure_logging
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from agent import invoke_agent
     from channel.weixin.weixin_api import CDN_BASE_URL, DEFAULT_BASE_URL, WeixinApi, download_media_from_cdn
     from channel.weixin.weixin_message import DownloadedAttachment, WeixinMessage
     from config import Settings, get_settings
+    from observability.context import bind_log_context
+    from observability.events import log_event, log_exception, preview_text
+    from observability.logging import configure_logging
 from multimodal_rag_agent.docreader_service.client import DocreaderService
 from multimodal_rag_agent.docreader_service.schemas import ParseRequest
 from multimodal_rag_agent.models import ImageRef, ParsedDocument
-
-
-logger = logging.getLogger(__name__)
 
 QR_LOGIN_TIMEOUT_S = 480
 QR_MAX_REFRESHES = 10
@@ -94,6 +97,7 @@ class WeixinChannel:
 
     def run(self) -> None:
         """Authenticate if needed and start the long-poll loop."""
+        configure_logging(self.settings)
         self.api = self.api or self._build_authenticated_api()
         self._poll_loop()
 
@@ -113,23 +117,53 @@ class WeixinChannel:
 
         if self.api is None:
             self.api = self._build_api(token=self.settings.weixin_token)
+        thread_id = f"weixin:{from_user_id}"
+        with bind_log_context(
+            request_id=f"weixin:{message_id}",
+            thread_id=thread_id,
+            channel="weixin",
+            message_id=message_id,
+            from_user_id=from_user_id,
+        ):
+            log_event(
+                "message_received",
+                message_type=str(raw_msg.get("message_type", "")),
+                has_context_token=bool(context_token),
+            )
 
-        message = WeixinMessage(
-            raw_msg,
-            tmp_dir=self.settings.weixin_tmp_dir,
-            cdn_base_url=self.api.cdn_base_url,
-            media_downloader=self.media_downloader,
-        )
+            message = WeixinMessage(
+                raw_msg,
+                tmp_dir=self.settings.weixin_tmp_dir,
+                cdn_base_url=self.api.cdn_base_url,
+                media_downloader=self.media_downloader,
+            )
 
-        try:
-            prompt, images = self._build_agent_turn(message)
-        except UserFacingAttachmentError as exc:
-            self._reply_text(from_user_id, context_token, str(exc))
-            return str(exc)
+            try:
+                prompt, images = self._build_agent_turn(message)
+            except UserFacingAttachmentError as exc:
+                log_exception("attachment_adaptation_failed", exc, stage="weixin_build_agent_turn")
+                self._reply_text(from_user_id, context_token, str(exc))
+                return str(exc)
 
-        answer = self.agent_runner(prompt, f"weixin:{from_user_id}", images)
-        self._reply_text(from_user_id, context_token, answer)
-        return answer
+            log_event(
+                "message_normalized",
+                url_count=len(message.urls),
+                attachment_count=len(message.attachments),
+                image_count=len(images),
+                prompt_preview=preview_text(prompt),
+            )
+            try:
+                answer = self.agent_runner(prompt, thread_id, images)
+                self._reply_text(from_user_id, context_token, answer)
+                log_event(
+                    "reply_sent",
+                    reply_channel="weixin",
+                    answer_length=len(answer),
+                    answer_preview=preview_text(answer),
+                )
+                return answer
+            except Exception:  # noqa: BLE001
+                raise
 
     def _poll_loop(self) -> None:
         assert self.api is not None
@@ -141,13 +175,28 @@ class WeixinChannel:
                 errcode = int(response.get("errcode", 0) or 0)
                 if ret != 0 or errcode != 0:
                     if errcode == SESSION_EXPIRED_ERRCODE or ret == SESSION_EXPIRED_ERRCODE:
-                        logger.warning("Weixin session expired, triggering re-login")
+                        log_event(
+                            "channel_auth_refresh_requested",
+                            level=logging.WARNING,
+                            channel="weixin",
+                            reason="session_expired",
+                            ret=ret,
+                            errcode=errcode,
+                        )
                         self.api = self._build_authenticated_api(force_relogin=True)
                         self._cursor = ""
                         failures = 0
                         continue
                     failures += 1
-                    logger.error("Weixin getUpdates error ret=%s errcode=%s", ret, errcode)
+                    log_event(
+                        "channel_poll_error",
+                        level=logging.ERROR,
+                        channel="weixin",
+                        ret=ret,
+                        errcode=errcode,
+                        failure_count=failures,
+                        cursor_present=bool(self._cursor),
+                    )
                     time.sleep(BACKOFF_DELAY if failures >= MAX_CONSECUTIVE_FAILURES else RETRY_DELAY)
                     if failures >= MAX_CONSECUTIVE_FAILURES:
                         failures = 0
@@ -158,15 +207,40 @@ class WeixinChannel:
                 if new_cursor:
                     self._cursor = new_cursor
                 for raw_msg in response.get("msgs", []):
+                    message_id = str(raw_msg.get("message_id", raw_msg.get("seq", "")))
+                    from_user_id = str(raw_msg.get("from_user_id", ""))
+                    context_token = str(raw_msg.get("context_token", ""))
                     try:
-                        self.handle_raw_message(raw_msg)
-                    except Exception:
-                        logger.exception("Failed to process Weixin message")
+                        with bind_log_context(
+                            request_id=f"weixin:{message_id}" if message_id else "",
+                            thread_id=f"weixin:{from_user_id}" if from_user_id else "",
+                            channel="weixin",
+                            message_id=message_id,
+                            from_user_id=from_user_id,
+                        ):
+                            self.handle_raw_message(raw_msg)
+                    except Exception as exc:  # noqa: BLE001
+                        log_exception(
+                            "request_failed",
+                            exc,
+                            stage="weixin_poll_loop_message",
+                            channel="weixin",
+                            message_id=message_id,
+                            from_user_id=from_user_id,
+                            has_context_token=bool(context_token),
+                        )
             except KeyboardInterrupt:
                 raise
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
                 failures += 1
-                logger.exception("Weixin long-poll failed")
+                log_exception(
+                    "channel_poll_failed",
+                    exc,
+                    stage="weixin_poll_loop",
+                    channel="weixin",
+                    failure_count=failures,
+                    cursor_present=bool(self._cursor),
+                )
                 time.sleep(BACKOFF_DELAY if failures >= MAX_CONSECUTIVE_FAILURES else RETRY_DELAY)
                 if failures >= MAX_CONSECUTIVE_FAILURES:
                     failures = 0
@@ -249,7 +323,14 @@ class WeixinChannel:
             file_name = f"{message_id}_{source_kind}_{index}{suffix}"
             save_path = self.settings.weixin_tmp_dir / file_name
             save_path.write_bytes(image_ref.image_data)
-            logger.debug("Saved parsed %s image %s to %s", source_kind, source_label, save_path)
+            log_event(
+                "attachment_image_saved",
+                level=logging.DEBUG,
+                channel="weixin",
+                source_kind=source_kind,
+                source_label=source_label,
+                save_path=str(save_path),
+            )
             saved_paths.append(str(save_path))
         return saved_paths
 
@@ -309,7 +390,14 @@ class WeixinChannel:
         if not context_token and to_user_id:
             context_token = self._context_tokens.get(to_user_id, "")
         if not to_user_id or not context_token:
-            logger.warning("Skipping Weixin reply because to_user_id/context_token is missing")
+            log_event(
+                "reply_skipped",
+                level=logging.WARNING,
+                reply_channel="weixin",
+                reason="missing_reply_target",
+                has_to_user_id=bool(to_user_id),
+                has_context_token=bool(context_token),
+            )
             return
         assert self.api is not None
         for chunk in self._split_text(text, TEXT_CHUNK_LIMIT):
@@ -360,8 +448,14 @@ class WeixinChannel:
         try:
             if self.settings.weixin_credentials_path.exists():
                 return json.loads(self.settings.weixin_credentials_path.read_text())
-        except Exception:
-            logger.exception("Failed to load Weixin credentials")
+        except Exception as exc:  # noqa: BLE001
+            log_exception(
+                "credentials_load_failed",
+                exc,
+                channel="weixin",
+                stage="weixin_load_credentials",
+                credentials_path=str(self.settings.weixin_credentials_path),
+            )
         return {}
 
     def _save_credentials(self, payload: dict) -> None:
@@ -386,8 +480,13 @@ class WeixinChannel:
                 qr.print_ascii(out=buffer, invert=True)
                 print(buffer.getvalue())
                 return
-        except Exception:
-            logger.exception("Failed to render QR code in terminal")
+        except Exception as exc:  # noqa: BLE001
+            log_exception(
+                "terminal_render_failed",
+                exc,
+                channel="weixin",
+                stage="weixin_print_qr",
+            )
         print(f"请扫描微信二维码登录：{qrcode_url}")
 
     def _qr_login(self, base_url: str) -> dict:
@@ -434,9 +533,10 @@ class WeixinChannel:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
     load_dotenv(Settings().env_path)
-    WeixinChannel().run()
+    settings = get_settings()
+    configure_logging(settings)
+    WeixinChannel(settings=settings).run()
 
 
 if __name__ == "__main__":

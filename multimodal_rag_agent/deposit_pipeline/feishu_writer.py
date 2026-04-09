@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 import requests
@@ -16,6 +17,18 @@ try:
     from feishu_wiki_rag_agent.config import Settings, get_settings
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from config import Settings, get_settings
+
+try:
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    try:
+        from observability.events import log_event, log_exception
+    except ModuleNotFoundError:  # pragma: no cover - optional dependency fallback
+        def log_event(event: str, **_: Any) -> None:
+            return None
+
+        def log_exception(event: str, exc: BaseException, **_: Any) -> None:
+            return None
 
 
 @dataclass(slots=True)
@@ -68,22 +81,53 @@ class FeishuDepositWriter:
         target_space_id: str,
         target_parent_node_token: str,
     ) -> FeishuWriteResult:
+        started_at = perf_counter()
         backend = (self.settings.feishu_deposit_write_backend or "lark_cli").strip().lower()
-        if backend == "lark_cli":
-            return self._write_markdown_via_lark_cli(
+        log_event(
+            "feishu_write_started",
+            title=title,
+            backend=backend,
+            target_space_id=target_space_id,
+            has_parent_node=bool(target_parent_node_token),
+        )
+        try:
+            if backend == "lark_cli":
+                result = self._write_markdown_via_lark_cli(
+                    title=title,
+                    markdown_content=markdown_content,
+                    target_space_id=target_space_id,
+                    target_parent_node_token=target_parent_node_token,
+                )
+            elif backend == "openapi":
+                result = self._write_markdown_via_openapi(
+                    title=title,
+                    markdown_content=markdown_content,
+                    target_space_id=target_space_id,
+                    target_parent_node_token=target_parent_node_token,
+                )
+            else:
+                raise RuntimeError(f"Unsupported FEISHU_DEPOSIT_WRITE_BACKEND: {backend}")
+
+            elapsed_ms = (perf_counter() - started_at) * 1000
+            log_event(
+                "feishu_write_completed",
                 title=title,
-                markdown_content=markdown_content,
-                target_space_id=target_space_id,
-                target_parent_node_token=target_parent_node_token,
+                backend=backend,
+                document_token=result.document_token,
+                has_wiki_node=bool(result.wiki_node_token),
+                duration_ms=round(elapsed_ms, 1),
             )
-        if backend == "openapi":
-            return self._write_markdown_via_openapi(
+            return result
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = (perf_counter() - started_at) * 1000
+            log_exception(
+                "feishu_write_failed",
+                exc,
                 title=title,
-                markdown_content=markdown_content,
-                target_space_id=target_space_id,
-                target_parent_node_token=target_parent_node_token,
+                backend=backend,
+                duration_ms=round(elapsed_ms, 1),
             )
-        raise RuntimeError(f"Unsupported FEISHU_DEPOSIT_WRITE_BACKEND: {backend}")
+            raise
 
     def _write_markdown_via_lark_cli(
         self,

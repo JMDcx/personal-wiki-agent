@@ -10,6 +10,8 @@ from rich.console import Console
 
 from feishu_wiki_rag_agent.channel.feishu.feishu_client import FeishuClient
 from feishu_wiki_rag_agent.config import Settings, get_settings
+from feishu_wiki_rag_agent.observability.events import log_event, log_exception
+from feishu_wiki_rag_agent.observability.logging import configure_logging
 from feishu_wiki_rag_agent.retrieval import write_index_manifest
 from multimodal_rag_agent.config import get_multimodal_settings
 from multimodal_rag_agent.ingest_pipeline.pipeline import IngestPipeline
@@ -32,6 +34,7 @@ def rebuild_index(
         raise RuntimeError(msg)
 
     pipeline = IngestPipeline(get_multimodal_settings())
+    log_event("index_rebuild_started", document_count=len(non_empty_documents))
     results = pipeline.ingest_documents(non_empty_documents, reset_index=True)
     total_chunks = sum(item.chunk_count for item in results)
     manifest = write_index_manifest(
@@ -40,6 +43,12 @@ def rebuild_index(
         chunk_count=total_chunks,
         settings=resolved,
     )
+    log_event(
+        "index_rebuild_completed",
+        document_count=len(results),
+        chunk_count=total_chunks,
+        root_token_count=len(resolved.feishu_wiki_root_tokens),
+    )
     return manifest.to_dict()
 
 
@@ -47,6 +56,7 @@ def main() -> None:
     """Run a full Feishu Wiki crawl and rebuild the Qdrant index."""
     load_dotenv(Path(__file__).resolve().parent / ".env")
     settings = get_settings()
+    configure_logging(settings)
 
     if not settings.feishu_wiki_root_tokens:
         msg = "FEISHU_WIKI_ROOT_TOKENS is required to build the local index."
@@ -55,10 +65,14 @@ def main() -> None:
     console.print("[bold blue]Feishu Wiki Multimodal RAG Indexer[/]")
     console.print(f"Roots: {', '.join(settings.feishu_wiki_root_tokens)}")
 
-    client = FeishuClient(settings)
-    documents = client.crawl_documents(settings.feishu_wiki_root_tokens)
-    console.print(f"Collected {len(documents)} non-empty documents before chunking")
-    manifest = rebuild_index(documents, settings)
+    try:
+        client = FeishuClient(settings)
+        documents = client.crawl_documents(settings.feishu_wiki_root_tokens)
+        console.print(f"Collected {len(documents)} non-empty documents before chunking")
+        manifest = rebuild_index(documents, settings)
+    except Exception as exc:  # noqa: BLE001
+        log_exception("index_rebuild_failed", exc)
+        raise
 
     console.print(f"[green]Indexed {manifest['document_count']} documents[/]")
     console.print(f"[green]Created {manifest['chunk_count']} chunks[/]")
