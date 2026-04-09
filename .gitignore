@@ -20,3 +20,6 @@ htmlcov/
 cookies.json
 scripts/__pycache__/
 tools/xiaohongshu-bin/xiaohongshu-*-darwin-arm64
+tests/test_channel_observability.py
+tests/test_observability_logging.py
+tests/test_qdrant_index.py
