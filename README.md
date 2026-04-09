@@ -48,9 +48,10 @@ The knowledge-deposit flow is:
 
 1. Detect whether the user wants to save content into the knowledge base
 2. Fetch source material from Xiaohongshu, generic URLs, plain text, or images
-3. Normalize the source into a markdown draft
-4. Optionally write the final draft into Feishu Docs / Wiki
-5. Ingest the final markdown into the local Qdrant index
+3. For image inputs, run OCR / caption extraction first and convert the result into text
+4. Normalize the source into a markdown draft
+5. Optionally write the final draft into Feishu Docs / Wiki
+6. Ingest the final markdown into the local Qdrant index
 
 ## Project Layout
 
@@ -178,6 +179,8 @@ MULTIMODAL_RAG_CHUNK_OVERLAP=128
 
 FEISHU_DEPOSIT_SPACE_ID=
 FEISHU_DEPOSIT_PARENT_NODE_TOKEN=
+FEISHU_DEPOSIT_WRITE_BACKEND=lark_cli
+FEISHU_LARK_CLI_PROFILE=feishu-wiki-rag-agent
 DEPOSIT_ENABLE_AUTO_WRITE=true
 XHS_MCP_URL=http://127.0.0.1:18060/mcp
 ```
@@ -238,6 +241,8 @@ The agent can now handle requests such as:
 
 When the source is Xiaohongshu, the runtime will call the local MCP service, normalize the note details, and build a structured knowledge draft.
 
+When the source is an image, the runtime will first extract text and visual content, then turn the parsed result into the same markdown draft format before writing to Feishu and indexing into Qdrant.
+
 To verify the MCP connection and the local deposit pipeline:
 
 ```bash
@@ -248,7 +253,89 @@ By default this runs in preview mode and does not write to Feishu. To enable ful
 
 - `FEISHU_DEPOSIT_SPACE_ID`
 - `FEISHU_DEPOSIT_PARENT_NODE_TOKEN`
+- `FEISHU_DEPOSIT_WRITE_BACKEND=lark_cli`
+- `FEISHU_LARK_CLI_PROFILE=feishu-wiki-rag-agent`
 - `DEPOSIT_ENABLE_AUTO_WRITE=true`
+
+The repository now defaults to the official `lark-cli` backend for Feishu write-back. The older direct OpenAPI backend is still available as a fallback by setting:
+
+```env
+FEISHU_DEPOSIT_WRITE_BACKEND=openapi
+```
+
+## Lark CLI Setup For Write-Back
+
+The recommended Feishu write path for knowledge deposit is now `lark-cli`.
+
+1. Install the official CLI:
+
+```bash
+npm install -g @larksuite/cli
+```
+
+2. Install the official agent skills:
+
+```bash
+npx skills add https://github.com/larksuite/cli -y -g
+```
+
+3. Initialize a profile with the same app credentials you already use in `.env`:
+
+```bash
+APP_ID=$(grep '^FEISHU_APP_ID=' .env | cut -d= -f2-)
+APP_SECRET=$(grep '^FEISHU_APP_SECRET=' .env | cut -d= -f2-)
+printf '%s' "$APP_SECRET" | lark-cli config init \
+  --app-id "$APP_ID" \
+  --app-secret-stdin \
+  --brand feishu \
+  --name feishu-wiki-rag-agent
+```
+
+4. Verify the profile:
+
+```bash
+lark-cli doctor --profile feishu-wiki-rag-agent
+lark-cli auth status --profile feishu-wiki-rag-agent
+```
+
+5. Grant the required app scopes in Feishu Open Platform. For the current knowledge-deposit flow, make sure the app has at least:
+
+- `drive:file:upload`
+- `drive:file`
+- `drive:drive`
+- `wiki:wiki`
+- `wiki:node:create`
+
+6. Make sure the target Wiki node itself is editable by the app identity. If the app can read a node but cannot create children below it, `lark-cli docs +create --wiki-node ...` will fail even when scopes are correct.
+
+7. Keep `.env` aligned with the CLI profile and backend:
+
+```env
+FEISHU_DEPOSIT_WRITE_BACKEND=lark_cli
+FEISHU_LARK_CLI_PROFILE=feishu-wiki-rag-agent
+FEISHU_DEPOSIT_SPACE_ID=7315304284768632833
+FEISHU_DEPOSIT_PARENT_NODE_TOKEN=GgTdw2UyYiUkljkvDKfcUTHdnQg
+DEPOSIT_ENABLE_AUTO_WRITE=true
+```
+
+8. Verify direct document creation with the official CLI before running the full deposit flow:
+
+```bash
+lark-cli docs +create \
+  --profile feishu-wiki-rag-agent \
+  --as bot \
+  --title "codex probe" \
+  --markdown "# probe\n\nhello" \
+  --wiki-node GgTdw2UyYiUkljkvDKfcUTHdnQg
+```
+
+9. Once the probe succeeds, run the end-to-end Xiaohongshu deposit test:
+
+```bash
+python scripts/verify_xhs_deposit.py --url "https://www.xiaohongshu.com/explore/xxx?xsec_token=yyy" --write
+```
+
+Note: full `--write` success requires both Feishu write-back and a running local Qdrant instance. If Feishu write-back succeeds but Qdrant is offline, the document may already exist in Feishu while the final local indexing step still fails.
 
 ## Feishu Setup
 
