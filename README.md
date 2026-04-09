@@ -130,6 +130,12 @@ docker run -d \
   qdrant/qdrant
 ```
 
+You can also use the included Compose file:
+
+```bash
+docker compose up -d qdrant
+```
+
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in your values.
@@ -150,6 +156,10 @@ FEISHU_RAG_EMBEDDING_MODEL=your_embedding_model_name
 FEISHU_RAG_EMBEDDING_API_KEY=your_embedding_api_key
 FEISHU_RAG_EMBEDDING_BASE_URL=https://your-embedding-compatible-endpoint/v1
 ```
+
+Notes:
+- If you use a Qwen embedding endpoint, keep the provider model id lowercase, for example `qwen3-embedding-4b`
+- If you start from a Feishu wiki URL such as `https://.../wiki/HjPjwGtbrikafFkN6sdcSe9zn0d`, set `FEISHU_WIKI_ROOT_TOKENS` to the trailing node token: `HjPjwGtbrikafFkN6sdcSe9zn0d`
 
 Optional variables:
 

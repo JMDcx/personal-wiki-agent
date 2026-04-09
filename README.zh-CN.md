@@ -130,6 +130,12 @@ docker run -d \
   qdrant/qdrant
 ```
 
+也可以直接使用仓库里的 Compose 配置：
+
+```bash
+docker compose up -d qdrant
+```
+
 ## 配置
 
 将 `.env.example` 复制为 `.env`，然后填写你的配置。
@@ -150,6 +156,10 @@ FEISHU_RAG_EMBEDDING_MODEL=your_embedding_model_name
 FEISHU_RAG_EMBEDDING_API_KEY=your_embedding_api_key
 FEISHU_RAG_EMBEDDING_BASE_URL=https://your-embedding-compatible-endpoint/v1
 ```
+
+注意：
+- 如果你使用 Qwen embedding，模型名请保持 provider 要求的小写形式，例如 `qwen3-embedding-4b`
+- 如果你拿到的是飞书 wiki 链接，例如 `https://.../wiki/HjPjwGtbrikafFkN6sdcSe9zn0d`，则 `FEISHU_WIKI_ROOT_TOKENS` 应填写链接末尾的 node token，即 `HjPjwGtbrikafFkN6sdcSe9zn0d`
 
 可选变量：
 
@@ -277,6 +287,12 @@ docker run -d \
   -p 6334:6334 \
   -v "$(pwd)/data/qdrant_storage:/qdrant/storage" \
   qdrant/qdrant
+```
+
+或者：
+
+```bash
+docker compose up -d qdrant
 ```
 
 在启动机器人之前，先运行手动入库步骤：

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
 from typing import Any
 
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
@@ -19,8 +20,18 @@ class QdrantIndex:
         if self._client is None:
             from qdrant_client import QdrantClient
 
-            self._client = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key or None)
+            client_kwargs: dict[str, Any] = {
+                "url": self.settings.qdrant_url,
+                "api_key": self.settings.qdrant_api_key or None,
+            }
+            if self._is_local_qdrant_url():
+                client_kwargs["trust_env"] = False
+            self._client = QdrantClient(**client_kwargs)
         return self._client
+
+    def _is_local_qdrant_url(self) -> bool:
+        parsed = urlparse(self.settings.qdrant_url)
+        return parsed.hostname in {"localhost", "127.0.0.1"}
 
     def ensure_collection(self) -> None:
         from qdrant_client.http import models as rest
