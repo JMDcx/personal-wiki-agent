@@ -134,6 +134,12 @@ class Settings:
     feishu_deposit_parent_node_token: str = field(
         default_factory=lambda: os.getenv("FEISHU_DEPOSIT_PARENT_NODE_TOKEN", "")
     )
+    feishu_deposit_write_backend: str = field(
+        default_factory=lambda: os.getenv("FEISHU_DEPOSIT_WRITE_BACKEND", "lark_cli").strip().lower() or "lark_cli"
+    )
+    feishu_lark_cli_profile: str = field(
+        default_factory=lambda: os.getenv("FEISHU_LARK_CLI_PROFILE", "feishu-wiki-rag-agent")
+    )
     xhs_mcp_url: str = field(default_factory=lambda: os.getenv("XHS_MCP_URL", "http://127.0.0.1:18060/mcp"))
     deposit_enable_auto_write: bool = field(
         default_factory=lambda: os.getenv("DEPOSIT_ENABLE_AUTO_WRITE", "true").strip().lower() not in {"0", "false", "no"}

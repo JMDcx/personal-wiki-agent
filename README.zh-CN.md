@@ -48,9 +48,10 @@
 
 1. 识别用户是否在明确要求“沉淀到知识库”
 2. 从小红书、普通链接、纯文本或图片中提取原始材料
-3. 规范化为统一的 markdown 知识稿
-4. 按配置选择是否写回飞书 Doc / Wiki
-5. 将最终 markdown 写入本地 Qdrant 索引
+3. 对图片输入先做 OCR / caption / 视觉内容提取，再转成文本
+4. 规范化为统一的 markdown 知识稿
+5. 按配置选择是否写回飞书 Doc / Wiki
+6. 将最终 markdown 写入本地 Qdrant 索引
 
 ## 项目结构
 
@@ -188,6 +189,8 @@ MULTIMODAL_RAG_CHUNK_OVERLAP=128
 
 FEISHU_DEPOSIT_SPACE_ID=
 FEISHU_DEPOSIT_PARENT_NODE_TOKEN=
+FEISHU_DEPOSIT_WRITE_BACKEND=lark_cli
+FEISHU_LARK_CLI_PROFILE=feishu-wiki-rag-agent
 DEPOSIT_ENABLE_AUTO_WRITE=true
 XHS_MCP_URL=http://127.0.0.1:18060/mcp
 ```
@@ -248,6 +251,8 @@ XHS_MCP_URL=http://127.0.0.1:18060/mcp
 
 当来源是小红书时，运行时会调用本地 MCP 服务抓取帖子详情，再生成结构化知识稿。
 
+当来源是图片时，运行时会先提取图片中的文字和视觉信息，再按同样的知识稿格式沉淀到飞书和本地索引。
+
 如果你想验证 Xiaohongshu MCP 和本地沉淀链路是否通畅，可以运行：
 
 ```bash
@@ -258,7 +263,94 @@ python scripts/verify_xhs_deposit.py --url "https://www.xiaohongshu.com/explore/
 
 - `FEISHU_DEPOSIT_SPACE_ID`
 - `FEISHU_DEPOSIT_PARENT_NODE_TOKEN`
+- `FEISHU_DEPOSIT_WRITE_BACKEND=lark_cli`
+- `FEISHU_LARK_CLI_PROFILE=feishu-wiki-rag-agent`
 - `DEPOSIT_ENABLE_AUTO_WRITE=true`
+
+当前仓库默认使用官方 `lark-cli` 作为飞书写回后端。如果你确实要回退到之前的直连 OpenAPI 方式，也可以显式设置：
+
+```env
+FEISHU_DEPOSIT_WRITE_BACKEND=openapi
+```
+
+## lark-cli 安装与写入配置
+
+当前知识沉淀写回飞书的推荐路径是 `lark-cli`。
+
+1. 安装官方 CLI：
+
+```bash
+npm install -g @larksuite/cli
+```
+
+2. 安装官方 skills：
+
+```bash
+npx skills add https://github.com/larksuite/cli -y -g
+```
+
+3. 使用 `.env` 中已有的飞书应用配置初始化 profile：
+
+```bash
+APP_ID=$(grep '^FEISHU_APP_ID=' .env | cut -d= -f2-)
+APP_SECRET=$(grep '^FEISHU_APP_SECRET=' .env | cut -d= -f2-)
+printf '%s' "$APP_SECRET" | lark-cli config init \
+  --app-id "$APP_ID" \
+  --app-secret-stdin \
+  --brand feishu \
+  --name feishu-wiki-rag-agent
+```
+
+4. 检查 profile 是否可用：
+
+```bash
+lark-cli doctor --profile feishu-wiki-rag-agent
+lark-cli auth status --profile feishu-wiki-rag-agent
+```
+
+5. 在飞书开放平台确认应用至少具备这些权限：
+
+- `drive:file:upload`
+- `drive:file`
+- `drive:drive`
+- `wiki:wiki`
+- `wiki:node:create`
+
+6. 确认目标 Wiki 节点本身对当前应用身份可编辑。如果应用对节点只有读权限、没有创建子节点权限，那么 `lark-cli docs +create --wiki-node ...` 仍然会失败。
+
+7. 保持 `.env` 与 CLI profile 对齐：
+
+```env
+FEISHU_DEPOSIT_WRITE_BACKEND=lark_cli
+FEISHU_LARK_CLI_PROFILE=feishu-wiki-rag-agent
+FEISHU_DEPOSIT_SPACE_ID=7315304284768632833
+FEISHU_DEPOSIT_PARENT_NODE_TOKEN=GgTdw2UyYiUkljkvDKfcUTHdnQg
+DEPOSIT_ENABLE_AUTO_WRITE=true
+```
+
+8. 在跑完整沉淀链路之前，先用官方 CLI 验证是否能直接在目标 Wiki 节点下创建文档：
+
+```bash
+lark-cli docs +create \
+  --profile feishu-wiki-rag-agent \
+  --as bot \
+  --title "codex probe" \
+  --markdown "# probe\n\nhello" \
+  --wiki-node GgTdw2UyYiUkljkvDKfcUTHdnQg
+```
+
+9. 验证通过后，再跑完整小红书沉淀写入：
+
+```bash
+python scripts/verify_xhs_deposit.py --url "https://www.xiaohongshu.com/explore/xxx?xsec_token=yyy" --write
+```
+
+说明：完整 `--write` 成功依赖两部分都可用：
+
+- 飞书写回
+- 本地 Qdrant 索引
+
+如果飞书已经写成功，但本地 Qdrant 没启动，那么你可能会在终端里看到最终报错，但文档其实已经出现在飞书里。
 
 ## 飞书配置
 

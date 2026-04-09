@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from time import perf_counter
@@ -12,10 +15,20 @@ import requests
 
 try:
     from feishu_wiki_rag_agent.config import Settings, get_settings
-    from feishu_wiki_rag_agent.observability.events import log_event, log_exception
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from config import Settings, get_settings
-    from observability.events import log_event, log_exception
+
+try:
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    try:
+        from observability.events import log_event, log_exception
+    except ModuleNotFoundError:  # pragma: no cover - optional dependency fallback
+        def log_event(event: str, **_: Any) -> None:
+            return None
+
+        def log_exception(event: str, exc: BaseException, **_: Any) -> None:
+            return None
 
 
 @dataclass(slots=True)
@@ -27,7 +40,7 @@ class FeishuWriteResult:
 
 
 class FeishuDepositWriter:
-    """Import markdown into Feishu Docs, then move it into Wiki."""
+    """Write markdown through either the direct OpenAPI path or lark-cli."""
 
     def __init__(
         self,
@@ -35,10 +48,12 @@ class FeishuDepositWriter:
         *,
         feishu_client: Any | None = None,
         request_timeout: int | None = None,
+        cli_runner: Any | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.feishu_client = feishu_client or self._build_feishu_client()
         self.request_timeout = request_timeout or self.settings.feishu_request_timeout
+        self.cli_runner = cli_runner or subprocess.run
 
     def _build_feishu_client(self) -> Any:
         try:
@@ -67,50 +82,142 @@ class FeishuDepositWriter:
         target_parent_node_token: str,
     ) -> FeishuWriteResult:
         started_at = perf_counter()
+        backend = (self.settings.feishu_deposit_write_backend or "lark_cli").strip().lower()
         log_event(
             "feishu_write_started",
             title=title,
+            backend=backend,
             target_space_id=target_space_id,
             has_parent_node=bool(target_parent_node_token),
         )
         try:
-            file_token = self._upload_markdown_file(file_name=f"{title}.md", markdown_content=markdown_content)
-            import_result = self._create_import_task(
-                file_token=file_token,
-                title=title,
-                target_parent_node_token=target_parent_node_token,
-            )
-            move_result = self._move_doc_to_wiki(
-                document_token=import_result.document_token,
-                target_space_id=target_space_id,
-                target_parent_node_token=target_parent_node_token,
-            )
+            if backend == "lark_cli":
+                result = self._write_markdown_via_lark_cli(
+                    title=title,
+                    markdown_content=markdown_content,
+                    target_space_id=target_space_id,
+                    target_parent_node_token=target_parent_node_token,
+                )
+            elif backend == "openapi":
+                result = self._write_markdown_via_openapi(
+                    title=title,
+                    markdown_content=markdown_content,
+                    target_space_id=target_space_id,
+                    target_parent_node_token=target_parent_node_token,
+                )
+            else:
+                raise RuntimeError(f"Unsupported FEISHU_DEPOSIT_WRITE_BACKEND: {backend}")
+
             elapsed_ms = (perf_counter() - started_at) * 1000
             log_event(
                 "feishu_write_completed",
                 title=title,
-                document_token=import_result.document_token,
-                has_wiki_node=bool(move_result.wiki_node_token),
+                backend=backend,
+                document_token=result.document_token,
+                has_wiki_node=bool(result.wiki_node_token),
                 duration_ms=round(elapsed_ms, 1),
             )
-            return FeishuWriteResult(
-                document_token=import_result.document_token,
-                document_url=import_result.document_url,
-                wiki_node_token=move_result.wiki_node_token,
-                raw_payload={
-                    "import": import_result.raw_payload or {},
-                    "move": move_result.raw_payload or {},
-                },
-            )
+            return result
         except Exception as exc:  # noqa: BLE001
             elapsed_ms = (perf_counter() - started_at) * 1000
             log_exception(
                 "feishu_write_failed",
                 exc,
                 title=title,
+                backend=backend,
                 duration_ms=round(elapsed_ms, 1),
             )
             raise
+
+    def _write_markdown_via_lark_cli(
+        self,
+        *,
+        title: str,
+        markdown_content: str,
+        target_space_id: str,
+        target_parent_node_token: str,
+    ) -> FeishuWriteResult:
+        if not shutil.which("lark-cli"):
+            raise RuntimeError("lark-cli is not installed or not in PATH.")
+
+        profile = self.settings.feishu_lark_cli_profile.strip() or "feishu-wiki-rag-agent"
+        sanitized_title = self._sanitize_title(title)
+        command = [
+            "lark-cli",
+            "docs",
+            "+create",
+            "--profile",
+            profile,
+            "--as",
+            "bot",
+            "--title",
+            sanitized_title,
+            "--markdown",
+            markdown_content,
+        ]
+        if target_parent_node_token:
+            command.extend(["--wiki-node", target_parent_node_token])
+        elif target_space_id:
+            command.extend(["--wiki-space", target_space_id])
+
+        result = self.cli_runner(command, capture_output=True, text=True, timeout=self.request_timeout)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"lark-cli docs +create failed: {detail}")
+
+        stdout = result.stdout.strip()
+        if not stdout:
+            raise RuntimeError("lark-cli docs +create returned empty output.")
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"lark-cli docs +create returned non-JSON output: {stdout}") from exc
+
+        if not payload.get("ok"):
+            error = payload.get("error") or {}
+            message = error.get("message") or stdout
+            raise RuntimeError(f"lark-cli docs +create failed: {message}")
+
+        data = payload.get("data") or {}
+        document_token = str(data.get("doc_id") or data.get("document_id") or "").strip()
+        document_url = str(data.get("doc_url") or data.get("url") or "").strip()
+        wiki_node_token = self._extract_token_from_url(document_url)
+        if not document_token:
+            raise RuntimeError(f"lark-cli docs +create succeeded but doc_id is missing: {stdout}")
+        return FeishuWriteResult(
+            document_token=document_token,
+            document_url=document_url,
+            wiki_node_token=wiki_node_token,
+            raw_payload=payload,
+        )
+
+    def _write_markdown_via_openapi(
+        self,
+        *,
+        title: str,
+        markdown_content: str,
+        target_space_id: str,
+        target_parent_node_token: str,
+    ) -> FeishuWriteResult:
+        file_token = self._upload_markdown_file(
+            file_name=self._sanitize_upload_file_name(f"{title}.md"),
+            markdown_content=markdown_content,
+        )
+        import_result = self._create_import_task(file_token=file_token, title=title)
+        move_result = self._move_doc_to_wiki(
+            document_token=import_result.document_token,
+            target_space_id=target_space_id,
+            target_parent_node_token=target_parent_node_token,
+        )
+        return FeishuWriteResult(
+            document_token=import_result.document_token,
+            document_url=move_result.document_url or import_result.document_url,
+            wiki_node_token=move_result.wiki_node_token,
+            raw_payload={
+                "import": import_result.raw_payload or {},
+                "move": move_result.raw_payload or {},
+            },
+        )
 
     def _upload_markdown_file(self, *, file_name: str, markdown_content: str) -> str:
         token = self.feishu_client.fetch_tenant_access_token()
@@ -121,12 +228,18 @@ class FeishuDepositWriter:
                 "file_name": file_name,
                 "parent_type": "explorer",
                 "parent_node": "",
-                "size": str(len(markdown_content.encode('utf-8'))),
+                "size": str(len(markdown_content.encode("utf-8"))),
             },
             files={"file": (file_name, markdown_content.encode("utf-8"), "text/markdown")},
             timeout=self.request_timeout,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            detail = response.text.strip()
+            if detail:
+                raise RuntimeError(f"Feishu upload failed: HTTP {response.status_code} {detail}") from exc
+            raise
         payload = response.json()
         if payload.get("code", 0) != 0:
             raise RuntimeError(f"Feishu upload failed: {payload.get('msg', 'unknown error')}")
@@ -140,7 +253,6 @@ class FeishuDepositWriter:
         *,
         file_token: str,
         title: str,
-        target_parent_node_token: str,
     ) -> FeishuWriteResult:
         payload = self.feishu_client._request(  # noqa: SLF001
             "POST",
@@ -149,19 +261,27 @@ class FeishuDepositWriter:
                 "file_token": file_token,
                 "type": "docx",
                 "file_extension": "md",
-                "file_name": title,
+                "file_name": self._sanitize_title(title),
                 "point": {
                     "mount_type": 1,
-                    "mount_key": target_parent_node_token,
+                    "mount_key": "",
                 },
             },
         )
         ticket = str(payload.get("data", {}).get("ticket", "")).strip()
         if not ticket:
             raise RuntimeError("Feishu import task did not return a ticket.")
-        return self._poll_import_task(ticket)
+        return self._poll_import_task(ticket, file_token=file_token, title=title)
 
-    def _poll_import_task(self, ticket: str, *, max_attempts: int = 15, poll_interval: float = 1.0) -> FeishuWriteResult:
+    def _poll_import_task(
+        self,
+        ticket: str,
+        *,
+        file_token: str,
+        title: str,
+        max_attempts: int = 15,
+        poll_interval: float = 1.0,
+    ) -> FeishuWriteResult:
         last_payload: dict[str, Any] | None = None
         for _ in range(max_attempts):
             payload = self.feishu_client._request("GET", f"/open-apis/drive/v1/import_tasks/{ticket}")
@@ -184,7 +304,10 @@ class FeishuDepositWriter:
                     raw_payload=payload,
                 )
             if job_status == 2:
-                raise RuntimeError(f"Feishu import failed: {json.dumps(payload, ensure_ascii=False)}")
+                raise RuntimeError(
+                    "Feishu import failed: "
+                    f"title={title}, file_token={file_token}, payload={json.dumps(payload, ensure_ascii=False)}"
+                )
             time.sleep(poll_interval)
         raise RuntimeError(f"Feishu import task timed out: {json.dumps(last_payload or {}, ensure_ascii=False)}")
 
@@ -231,3 +354,20 @@ class FeishuDepositWriter:
                 break
             time.sleep(poll_interval)
         raise RuntimeError(f"Wiki move task timed out: {json.dumps(last_payload or {}, ensure_ascii=False)}")
+
+    @staticmethod
+    def _sanitize_upload_file_name(file_name: str) -> str:
+        sanitized = re.sub(r'[\\/:*?"<>|]+', "_", file_name).strip().strip(".")
+        return sanitized or "deposit.md"
+
+    @staticmethod
+    def _sanitize_title(title: str) -> str:
+        sanitized = re.sub(r'[\\/:*?"<>|]+', "_", title).strip()
+        return sanitized or "未命名沉淀"
+
+    @staticmethod
+    def _extract_token_from_url(url: str) -> str:
+        value = url.rstrip("/")
+        if not value:
+            return ""
+        return value.split("/")[-1]
