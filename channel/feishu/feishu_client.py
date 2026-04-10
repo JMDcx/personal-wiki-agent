@@ -115,6 +115,20 @@ class FeishuClient:
             },
         )
 
+    def get_message(self, message_id: str) -> dict[str, Any]:
+        """Fetch a single Feishu message for reply-context reconstruction."""
+        payload = self._request("GET", f"/open-apis/im/v1/messages/{message_id}")
+        data = payload.get("data", {})
+        items = data.get("items", [])
+        if isinstance(items, list) and items:
+            item = items[0]
+            if isinstance(item, dict):
+                return item
+        message = data.get("message")
+        if isinstance(message, dict):
+            return message
+        raise RuntimeError(f"Feishu message {message_id} not found")
+
     def get_wiki_node(self, node_token: str) -> dict[str, Any]:
         """Fetch metadata for a single wiki node."""
         try:

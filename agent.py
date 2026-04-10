@@ -313,6 +313,7 @@ def _build_controller_context(
     question: str,
     thread_id: str,
     images: list[str],
+    message_context: dict[str, object] | None,
     language: str,
     settings: Settings,
     multimodal_settings: MultimodalRAGSettings,
@@ -344,6 +345,7 @@ def _build_controller_context(
         history=history,
         allow_retrieval=allow_retrieval,
         images=images,
+        message_context=message_context,
     )
     current_time = datetime.now().isoformat(timespec="seconds")
     context = ControllerInputContext(
@@ -369,6 +371,29 @@ def _build_controller_context(
         question_preview=_question_preview(question),
         history_turn_count=len(history),
         image_count=len(images),
+        is_reply=(
+            bool(message_context.get("reply_context", {}).get("is_reply"))
+            if isinstance(message_context.get("reply_context"), dict)
+            else False
+        )
+        if message_context
+        else False,
+        reply_parent_id=(
+            str(message_context.get("reply_context", {}).get("parent_id", ""))
+            if isinstance(message_context.get("reply_context"), dict)
+            else ""
+        )
+        if message_context
+        else "",
+        reply_root_id=(
+            str(message_context.get("reply_context", {}).get("root_id", ""))
+            if isinstance(message_context.get("reply_context"), dict)
+            else ""
+        )
+        if message_context
+        else "",
+        mentioned_users=message_context.get("mentioned_users", []) if message_context else [],
+        bot_mentioned=message_context.get("bot_mentioned", False) if message_context else False,
     )
     log_event(
         "controller_context_built",
@@ -601,6 +626,7 @@ def invoke_agent(
     settings: Settings | None = None,
     thread_id: str = "default",
     images: list[str] | None = None,
+    message_context: dict[str, object] | None = None,
     language: str = "中文",
 ) -> str:
     """Run the Deep Agent orchestrator backed by the multimodal RAG pipeline."""
@@ -629,6 +655,7 @@ def invoke_agent(
                 question=question,
                 thread_id=thread_id,
                 images=images or [],
+                message_context=message_context,
                 language=language,
                 settings=resolved,
                 multimodal_settings=multimodal_settings,
