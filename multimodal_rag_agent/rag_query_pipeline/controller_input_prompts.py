@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+try:
+    from feishu_wiki_rag_agent.protocols.renderers import render_controller_metadata_lines
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from protocols.renderers import render_controller_metadata_lines
+
 from multimodal_rag_agent.rag_query_pipeline.query_understand_service import HistoryTurn, QueryUnderstandResult
 
 
@@ -14,67 +19,15 @@ def render_controller_user_input(
     images: list[str] | None = None,
     message_context: dict[str, object] | None = None,
 ) -> str:
-    lines: list[str] = [
-        "[Runtime Metadata - for assistant control, not for direct user display]",
-        f"intent: {understand_result.intent}",
-        f"allow_retrieval: {'yes' if allow_retrieval else 'no'}",
-        f"rewrite_query: {understand_result.rewrite_query or question}",
-    ]
-
-    if understand_result.image_description:
-        lines.extend(
-            [
-                "image_description:",
-                understand_result.image_description,
-            ]
-        )
-    if images:
-        lines.extend(["image_paths:", *images])
-
-    if history:
-        lines.append("recent_history:")
-        for turn in history[-3:]:
-            lines.append(f"- User: {turn.user_question}")
-            lines.append(f"- Assistant: {turn.assistant_answer}")
-    if message_context:
-        lines.append("message_context:")
-        chat_type = str(message_context.get("chat_type", "")).strip()
-        if chat_type:
-            lines.append(f"chat_type: {chat_type}")
-        if message_context.get("bot_mentioned"):
-            lines.append("bot_mentioned: yes")
-        mentioned_users = [
-            str(user).strip()
-            for user in message_context.get("mentioned_users", [])
-            if str(user).strip()
-        ]
-        if mentioned_users:
-            lines.append(f"mentioned_users: {', '.join(mentioned_users)}")
-        mention_details: list[str] = []
-        for mention in message_context.get("mentions", []):
-            if not isinstance(mention, dict) or mention.get("is_bot"):
-                continue
-            display_name = str(mention.get("display_name", "")).strip()
-            open_id = str(mention.get("open_id", "")).strip()
-            if not display_name:
-                continue
-            mention_details.append(f"{display_name}({open_id})" if open_id else display_name)
-        if mention_details:
-            lines.append(f"mention_details: {', '.join(mention_details)}")
-        reply_context = message_context.get("reply_context", {})
-        if isinstance(reply_context, dict) and reply_context.get("is_reply"):
-            lines.append("reply_context:")
-            for key in (
-                "parent_id",
-                "root_id",
-                "parent_message_type",
-                "parent_role",
-                "parent_sender_name",
-                "parent_text_preview",
-            ):
-                value = str(reply_context.get(key, "")).strip()
-                if value:
-                    lines.append(f"{key}: {value}")
+    lines = render_controller_metadata_lines(
+        intent=understand_result.intent,
+        allow_retrieval=allow_retrieval,
+        rewrite_query=understand_result.rewrite_query or question,
+        image_description=understand_result.image_description,
+        images=images,
+        history=history,
+        message_context=message_context,
+    )
 
     lines.extend(
         [
