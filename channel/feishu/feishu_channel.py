@@ -30,7 +30,7 @@ try:
         preview_text,
     )
     from feishu_wiki_rag_agent.observability.logging import configure_logging
-    from feishu_wiki_rag_agent.schemas import IncomingMessage
+    from feishu_wiki_rag_agent.schemas import IncomingMessage, MentionRef, ReplyContext
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from agent import invoke_agent
     from config import Settings, get_settings
@@ -38,12 +38,13 @@ except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from observability.context import bind_log_context, bind_request_context, record_request_timing, update_request_state
     from observability.events import emit_request_summary, log_event, log_exception, preview_text
     from observability.logging import configure_logging
-    from schemas import IncomingMessage
+    from schemas import IncomingMessage, MentionRef, ReplyContext
 
 LARK_SDK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 lark = None
 
 logging.getLogger("Lark").setLevel(logging.WARNING)
+MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
 
 
 def _ensure_lark_imported():
@@ -81,12 +82,19 @@ class FeishuChannel:
         settings: Settings | None = None,
         *,
         client: FeishuClient | None = None,
-        agent_runner: Callable[[str, str], str] | None = None,
+        agent_runner: Callable[[str, str, dict[str, object] | None], str] | None = None,
         deduper: MessageDeduper | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.client = client or FeishuClient(self.settings)
-        self.agent_runner = agent_runner or (lambda text, thread_id: invoke_agent(text, settings=self.settings, thread_id=thread_id))
+        self.agent_runner = agent_runner or (
+            lambda text, thread_id, message_context=None: invoke_agent(
+                text,
+                settings=self.settings,
+                thread_id=thread_id,
+                message_context=message_context,
+            )
+        )
         self.deduper = deduper or MessageDeduper()
         self.bot_open_id: str | None = None
 
@@ -203,6 +211,15 @@ class FeishuChannel:
                 chat_type=incoming.chat_type,
                 sender_open_id=incoming.sender_open_id,
                 mention_count=len(incoming.mentions),
+                is_reply=bool(incoming.reply_context),
+                reply_parent_id=incoming.reply_context.parent_id if incoming.reply_context else "",
+                reply_root_id=incoming.reply_context.root_id if incoming.reply_context else "",
+                reply_parent_role=incoming.reply_context.parent_role if incoming.reply_context else "",
+                reply_parent_preview=(
+                    preview_text(incoming.reply_context.parent_text_preview) if incoming.reply_context else ""
+                ),
+                bot_mentioned=incoming.bot_mentioned,
+                mentioned_users=incoming.mentioned_users,
                 question_preview=preview_text(incoming.text),
             )
             log_event(
@@ -210,10 +227,19 @@ class FeishuChannel:
                 chat_type=incoming.chat_type,
                 sender_open_id=incoming.sender_open_id,
                 mention_count=len(incoming.mentions),
+                is_reply=bool(incoming.reply_context),
+                reply_parent_id=incoming.reply_context.parent_id if incoming.reply_context else "",
+                reply_root_id=incoming.reply_context.root_id if incoming.reply_context else "",
+                reply_parent_role=incoming.reply_context.parent_role if incoming.reply_context else "",
+                reply_parent_preview=(
+                    preview_text(incoming.reply_context.parent_text_preview) if incoming.reply_context else ""
+                ),
+                bot_mentioned=incoming.bot_mentioned,
+                mentioned_users=incoming.mentioned_users,
                 text_preview=preview_text(incoming.text),
             )
             try:
-                answer = self.agent_runner(incoming.text, thread_id)
+                answer = self.agent_runner(incoming.text, thread_id, incoming.to_message_context())
                 reply_started_at = perf_counter()
                 self.client.reply_text(incoming.message_id, answer)
                 reply_elapsed_ms = (perf_counter() - reply_started_at) * 1000
@@ -271,9 +297,14 @@ class FeishuChannel:
             )
 
             content = json.loads(message.get("content", "{}"))
-            text = str(content.get("text", "")).strip()
+            raw_text = str(content.get("text", "")).strip()
+            text = raw_text
             mentions = message.get("mentions", [])
             chat_type = str(message.get("chat_type", ""))
+            bot_mentioned = False
+            mentioned_users: list[str] = []
+            mention_refs = self._build_mention_refs(mentions)
+            reply_context = self._extract_reply_context(message)
 
             if chat_type == "group":
                 if not mentions:
@@ -282,7 +313,7 @@ class FeishuChannel:
                 if not self._mentions_bot(mentions):
                     log_event("message_ignored", reason="group_not_mentioning_bot")
                     return None
-                text = re.sub(r"@_user_\d+\s*", "", text).strip()
+                text, bot_mentioned, mentioned_users = self._normalize_group_message_text(raw_text, mentions)
 
             if not text:
                 log_event("message_ignored", reason="empty_text_after_normalization")
@@ -293,8 +324,13 @@ class FeishuChannel:
                 chat_id=chat_id,
                 chat_type=chat_type,
                 sender_open_id=str(sender.get("sender_id", {}).get("open_id", "")),
+                raw_text=raw_text,
                 text=text,
                 mentions=mentions,
+                mention_refs=mention_refs,
+                reply_context=reply_context,
+                bot_mentioned=bot_mentioned,
+                mentioned_users=mentioned_users,
             )
 
     def _mentions_bot(self, mentions: list[dict]) -> bool:
@@ -302,6 +338,169 @@ class FeishuChannel:
         if not self.bot_open_id:
             return True
         return any(mention.get("id", {}).get("open_id") == self.bot_open_id for mention in mentions)
+
+    def _normalize_group_message_text(self, raw_text: str, mentions: list[dict]) -> tuple[str, bool, list[str]]:
+        """Remove the bot mention while preserving other mentioned users as readable text."""
+        mention_index = 0
+        bot_mentioned = False
+        mentioned_users: list[str] = []
+
+        def replace(_match: re.Match[str]) -> str:
+            nonlocal mention_index, bot_mentioned
+            mention = mentions[mention_index] if mention_index < len(mentions) else None
+            mention_index += 1
+            if mention is None:
+                return ""
+            if self._is_bot_mention(mention):
+                bot_mentioned = True
+                return ""
+            display_name = self._mention_display_name(mention)
+            if display_name not in mentioned_users:
+                mentioned_users.append(display_name)
+            return f"@{display_name}"
+
+        normalized = MENTION_PLACEHOLDER_RE.sub(replace, raw_text)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        normalized = normalized.lstrip("，, ")
+        return normalized.strip(), bot_mentioned, mentioned_users
+
+    def _is_bot_mention(self, mention: dict) -> bool:
+        return bool(self.bot_open_id) and mention.get("id", {}).get("open_id") == self.bot_open_id
+
+    def _build_mention_refs(self, mentions: list[dict]) -> list[MentionRef]:
+        """Convert raw mention payloads into stable, transport-agnostic mention refs."""
+        refs: list[MentionRef] = []
+        for mention in mentions:
+            refs.append(
+                MentionRef(
+                    display_name=self._mention_display_name(mention),
+                    open_id=str(mention.get("id", {}).get("open_id", "")).strip(),
+                    is_bot=self._is_bot_mention(mention),
+                )
+            )
+        return refs
+
+    def _extract_reply_context(self, message: dict) -> ReplyContext | None:
+        """Build best-effort reply context from the current Feishu message."""
+        parent_id = str(message.get("parent_id", "")).strip()
+        if not parent_id:
+            return None
+        root_id = str(message.get("root_id", "")).strip() or parent_id
+        parent_text_preview = ""
+        parent_message_type = ""
+        parent_role = ""
+        parent_sender_name = ""
+        try:
+            parent_message = self.client.get_message(parent_id)
+            parent_text_preview, parent_message_type = self._extract_message_preview(parent_message)
+            parent_role = self._infer_parent_role(parent_message)
+            parent_sender_name = self._extract_sender_name(parent_message)
+        except Exception:  # noqa: BLE001
+            pass
+        return ReplyContext(
+            parent_id=parent_id,
+            root_id=root_id,
+            parent_text_preview=parent_text_preview,
+            parent_message_type=parent_message_type,
+            parent_role=parent_role,
+            parent_sender_name=parent_sender_name,
+        )
+
+    def _extract_message_preview(self, message: dict) -> tuple[str, str]:
+        """Extract a compact preview from a Feishu message payload."""
+        message_type = str(
+            message.get("message_type")
+            or message.get("msg_type")
+            or message.get("type")
+            or ""
+        ).strip()
+        content = message.get("content")
+        if content is None and isinstance(message.get("body"), dict):
+            content = message["body"].get("content")
+        preview = self._extract_text_content(content)
+        if not preview and message_type and message_type != "text":
+            preview = f"[{message_type} message]"
+        return preview_text(preview), message_type
+
+    @staticmethod
+    def _extract_text_content(content: object) -> str:
+        """Extract plain text from text-message content returned by Feishu."""
+        if isinstance(content, dict):
+            text = content.get("text")
+            return str(text).strip() if text else ""
+        if isinstance(content, str):
+            stripped = content.strip()
+            if not stripped:
+                return ""
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return stripped.removeprefix("text:").strip()
+            if isinstance(parsed, dict):
+                text = parsed.get("text")
+                return str(text).strip() if text else ""
+            return stripped
+        return ""
+
+    def _infer_parent_role(self, message: dict) -> str:
+        """Infer whether the replied-to message came from the bot or a user."""
+        sender_open_id = self._extract_sender_open_id(message)
+        sender_type = str(self._extract_sender_field(message, "sender_type")).strip().lower()
+        if self.bot_open_id and sender_open_id and sender_open_id == self.bot_open_id:
+            return "assistant"
+        if sender_type in {"app", "bot"}:
+            return "assistant"
+        return "user"
+
+    @staticmethod
+    def _extract_sender_open_id(message: dict) -> str:
+        sender = message.get("sender")
+        if isinstance(sender, dict):
+            sender_id = sender.get("sender_id")
+            if isinstance(sender_id, dict):
+                open_id = str(sender_id.get("open_id", "")).strip()
+                if open_id:
+                    return open_id
+            open_id = str(sender.get("open_id", "")).strip()
+            if open_id:
+                return open_id
+        return str(message.get("sender_open_id", "")).strip()
+
+    @staticmethod
+    def _extract_sender_name(message: dict) -> str:
+        sender = message.get("sender")
+        if isinstance(sender, dict):
+            for key in ("sender_name", "name", "display_name"):
+                value = str(sender.get(key, "")).strip()
+                if value:
+                    return value
+            sender_id = sender.get("sender_id")
+            if isinstance(sender_id, dict):
+                for key in ("name", "display_name", "open_id"):
+                    value = str(sender_id.get(key, "")).strip()
+                    if value:
+                        return value
+        for key in ("sender_name", "sender_display_name"):
+            value = str(message.get(key, "")).strip()
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _extract_sender_field(message: dict, field_name: str) -> object:
+        sender = message.get("sender")
+        if isinstance(sender, dict) and field_name in sender:
+            return sender.get(field_name)
+        return message.get(field_name)
+
+    @staticmethod
+    def _mention_display_name(mention: dict) -> str:
+        for key in ("name", "display_name", "key"):
+            value = str(mention.get(key, "")).strip()
+            if value:
+                return value
+        open_id = str(mention.get("id", {}).get("open_id", "")).strip()
+        return open_id or "mentioned_user"
 
 
 def main() -> None:
