@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import atexit
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -35,6 +34,10 @@ except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     )
     from observability.events import emit_request_summary, log_event, log_exception, preview_text
     from observability.logging import configure_logging
+try:
+    from feishu_wiki_rag_agent.schemas import MessageContext
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from schemas import MessageContext
 
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
 from multimodal_rag_agent.rag_query_pipeline.pipeline import RAGQueryPipeline
@@ -51,6 +54,19 @@ from multimodal_rag_agent.rag_query_pipeline.query_understand_service import (
 )
 from multimodal_rag_agent.deposit_pipeline.models import DepositRequest
 from multimodal_rag_agent.deposit_pipeline.pipeline import DepositPipeline
+try:
+    from feishu_wiki_rag_agent.protocols.controller_models import ControllerDecision
+    from feishu_wiki_rag_agent.protocols.renderers import render_deposit_result_text, render_retrieval_result_text
+    from feishu_wiki_rag_agent.protocols.tool_models import (
+        DepositRequestContext,
+        DepositResult,
+        RetrievalRequest,
+        RetrievalResult,
+    )
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from protocols.controller_models import ControllerDecision
+    from protocols.renderers import render_deposit_result_text, render_retrieval_result_text
+    from protocols.tool_models import DepositRequestContext, DepositResult, RetrievalRequest, RetrievalResult
 
 try:
     from langchain_core.messages import AIMessage
@@ -168,6 +184,76 @@ def _build_vlm_model_config(settings: MultimodalRAGSettings) -> ModelConfig | No
 
 def _create_query_understand_service(settings: MultimodalRAGSettings | None = None) -> QueryUnderstandService:
     return QueryUnderstandService(settings=settings or get_multimodal_settings())
+
+
+def _log_schema_warning(schema_stage: str, reason: str, **fields: object) -> None:
+    log_event(
+        "schema_normalization_warning",
+        level=logging.WARNING,
+        schema_stage=schema_stage,
+        reason=reason,
+        **fields,
+    )
+
+
+def _normalize_retrieval_request(query: str) -> RetrievalRequest:
+    request = RetrievalRequest.from_query(query, with_sources=True)
+    stripped_query = str(query or "").strip()
+    if stripped_query and request.query != stripped_query:
+        _log_schema_warning(
+            "retrieval_request",
+            "query_whitespace_normalized",
+            original_query_preview=_question_preview(str(query)),
+            normalized_query_preview=_question_preview(request.query),
+        )
+    if not request.query:
+        _log_schema_warning(
+            "retrieval_request",
+            "empty_query_after_normalization",
+            original_query_preview=_question_preview(str(query)),
+        )
+    return request
+
+
+def _normalize_deposit_request_context(*, text: str, image_paths_json: str) -> DepositRequestContext:
+    context = DepositRequestContext.from_inputs(text=text, image_paths_json=image_paths_json)
+    if context.invalid_image_paths_json:
+        _log_schema_warning(
+            "deposit_request",
+            "invalid_image_paths_json",
+            text_preview=_question_preview(context.text),
+        )
+    if context.dropped_image_path_count:
+        _log_schema_warning(
+            "deposit_request",
+            "blank_image_paths_dropped",
+            dropped_image_path_count=context.dropped_image_path_count,
+            image_count=len(context.image_paths),
+        )
+    if not context.text:
+        _log_schema_warning(
+            "deposit_request",
+            "empty_text_after_normalization",
+        )
+    return context
+
+
+def _normalize_message_context(message_context: MessageContext | dict[str, object] | None) -> MessageContext:
+    if hasattr(message_context, "to_dict") and hasattr(message_context, "mention_refs"):
+        return message_context
+    return MessageContext.from_dict(message_context)
+
+
+def _message_state_fields(message_context: MessageContext | dict[str, object] | None) -> dict[str, object]:
+    context = _normalize_message_context(message_context)
+    reply_context = context.reply_context
+    return {
+        "is_reply": reply_context is not None,
+        "reply_parent_id": reply_context.parent_id if reply_context is not None else "",
+        "reply_root_id": reply_context.root_id if reply_context is not None else "",
+        "mentioned_users": list(context.mentioned_users),
+        "bot_mentioned": context.bot_mentioned,
+    }
 
 
 def _build_checkpointer(settings: Settings) -> Any:
@@ -313,7 +399,7 @@ def _build_controller_context(
     question: str,
     thread_id: str,
     images: list[str],
-    message_context: dict[str, object] | None,
+    message_context: dict[str, object] | MessageContext | None,
     language: str,
     settings: Settings,
     multimodal_settings: MultimodalRAGSettings,
@@ -321,6 +407,7 @@ def _build_controller_context(
     chat_model_supports_vision: bool = False,
 ) -> ControllerInputContext:
     started_at = perf_counter()
+    normalized_message_context = _normalize_message_context(message_context)
     history = _load_history_from_runtime(agent_runtime, thread_id)
     understand_service = _create_query_understand_service(multimodal_settings)
     understand_result = understand_service.run(
@@ -339,19 +426,24 @@ def _build_controller_context(
             raw_output=understand_result.raw_output,
         )
     allow_retrieval = _intent_requires_retrieval(understand_result.intent)
+    controller_decision = ControllerDecision.from_query_understand(
+        understand_result,
+        fallback_question=question,
+        allow_retrieval=allow_retrieval,
+    )
     user_content = render_controller_user_input(
         question=question,
         understand_result=understand_result,
         history=history,
-        allow_retrieval=allow_retrieval,
+        allow_retrieval=controller_decision.allow_retrieval,
         images=images,
-        message_context=message_context,
+        message_context=normalized_message_context,
     )
     current_time = datetime.now().isoformat(timespec="seconds")
     context = ControllerInputContext(
         raw_question=question,
-        rewrite_query=understand_result.rewrite_query or question,
-        intent=understand_result.intent,
+        rewrite_query=controller_decision.rewrite_query,
+        intent=controller_decision.intent,
         image_description=understand_result.image_description,
         raw_output=understand_result.raw_output,
         history=history,
@@ -367,33 +459,11 @@ def _build_controller_context(
     record_request_timing("intent_ms", elapsed_ms)
     update_request_state(
         intent=context.intent,
-        allow_retrieval=allow_retrieval,
+        allow_retrieval=controller_decision.allow_retrieval,
         question_preview=_question_preview(question),
         history_turn_count=len(history),
         image_count=len(images),
-        is_reply=(
-            bool(message_context.get("reply_context", {}).get("is_reply"))
-            if isinstance(message_context.get("reply_context"), dict)
-            else False
-        )
-        if message_context
-        else False,
-        reply_parent_id=(
-            str(message_context.get("reply_context", {}).get("parent_id", ""))
-            if isinstance(message_context.get("reply_context"), dict)
-            else ""
-        )
-        if message_context
-        else "",
-        reply_root_id=(
-            str(message_context.get("reply_context", {}).get("root_id", ""))
-            if isinstance(message_context.get("reply_context"), dict)
-            else ""
-        )
-        if message_context
-        else "",
-        mentioned_users=message_context.get("mentioned_users", []) if message_context else [],
-        bot_mentioned=message_context.get("bot_mentioned", False) if message_context else False,
+        **_message_state_fields(normalized_message_context),
     )
     log_event(
         "controller_context_built",
@@ -418,13 +488,14 @@ def search_knowledge_tool_text(
     started_at = perf_counter()
     _ = settings or get_settings()
     rag_pipeline = pipeline or RAGQueryPipeline(get_multimodal_settings())
+    retrieval_request = _normalize_retrieval_request(query)
     log_event(
         "tool_called",
         tool_name="search_feishu_knowledge",
-        query_preview=_question_preview(query),
+        query_preview=_question_preview(retrieval_request.query),
     )
     try:
-        prepared = rag_pipeline.prepare_context(query, with_sources=True)
+        prepared = rag_pipeline.prepare_context(retrieval_request.query, with_sources=retrieval_request.with_sources)
     except Exception as exc:  # noqa: BLE001
         elapsed_ms = (perf_counter() - started_at) * 1000
         log_exception(
@@ -432,44 +503,36 @@ def search_knowledge_tool_text(
             exc,
             tool_name="search_feishu_knowledge",
             duration_ms=round(elapsed_ms, 1),
-            query_preview=_question_preview(query),
+            query_preview=_question_preview(retrieval_request.query),
         )
         raise
-    if not prepared.merged_chunks:
+    retrieval_result = RetrievalResult.from_prepared_context(retrieval_request.query, prepared)
+    if retrieval_result.result_status == "empty":
         elapsed_ms = (perf_counter() - started_at) * 1000
         log_event(
             "tool_completed",
             tool_name="search_feishu_knowledge",
             success=True,
-            result_status="empty",
-            chunk_count=0,
-            source_count=0,
+            result_status=retrieval_result.result_status,
+            chunk_count=retrieval_result.chunk_count,
+            source_count=retrieval_result.source_count,
             duration_ms=round(elapsed_ms, 1),
-            query_preview=_question_preview(query),
+            query_preview=_question_preview(retrieval_request.query),
         )
-        return "当前索引中未找到相关内容。"
+        return render_retrieval_result_text(retrieval_result)
 
-    lines: list[str] = [prepared.context]
-    if prepared.sources:
-        source_line = "来源：" + "；".join(
-            [
-                str(source.get("title") or source.get("source_uri") or "Untitled")
-                for source in prepared.sources
-            ]
-        )
-        lines.append(source_line)
     elapsed_ms = (perf_counter() - started_at) * 1000
     log_event(
         "tool_completed",
         tool_name="search_feishu_knowledge",
         success=True,
-        result_status="completed",
-        chunk_count=len(prepared.merged_chunks),
-        source_count=len(prepared.sources),
+        result_status=retrieval_result.result_status,
+        chunk_count=retrieval_result.chunk_count,
+        source_count=retrieval_result.source_count,
         duration_ms=round(elapsed_ms, 1),
-        query_preview=_question_preview(query),
+        query_preview=_question_preview(retrieval_request.query),
     )
-    return "\n\n".join(lines)
+    return render_retrieval_result_text(retrieval_result)
 
 
 def _is_knowledge_deposit_request(text: str) -> bool:
@@ -485,22 +548,18 @@ def deposit_knowledge_tool_text(
 ) -> str:
     resolved = settings or get_settings()
     deposit_pipeline = pipeline or DepositPipeline(resolved, get_multimodal_settings())
-    try:
-        image_paths = json.loads(image_paths_json) if image_paths_json.strip() else []
-    except json.JSONDecodeError:
-        image_paths = []
-    cleaned_image_paths = [str(path) for path in image_paths if str(path).strip()]
+    deposit_request_context = _normalize_deposit_request_context(text=text, image_paths_json=image_paths_json)
     log_event(
         "tool_called",
         tool_name="deposit_to_feishu_knowledge",
-        text_preview=_question_preview(text),
-        image_count=len(cleaned_image_paths),
+        text_preview=_question_preview(deposit_request_context.text),
+        image_count=len(deposit_request_context.image_paths),
     )
     try:
         result = deposit_pipeline.run(
             DepositRequest(
-                text=text,
-                image_paths=cleaned_image_paths,
+                text=deposit_request_context.text,
+                image_paths=deposit_request_context.image_paths,
             )
         )
     except Exception as exc:  # noqa: BLE001
@@ -508,25 +567,21 @@ def deposit_knowledge_tool_text(
             "tool_failed",
             exc,
             tool_name="deposit_to_feishu_knowledge",
-            text_preview=_question_preview(text),
-            image_count=len(cleaned_image_paths),
+            text_preview=_question_preview(deposit_request_context.text),
+            image_count=len(deposit_request_context.image_paths),
         )
         raise
+    deposit_result = DepositResult.from_pipeline_result(result)
     log_event(
         "tool_completed",
         tool_name="deposit_to_feishu_knowledge",
         success=True,
-        result_status=result.status,
-        source_type=result.draft.source_type,
-        local_document_id=result.local_document_id,
-        has_feishu_doc=bool(result.feishu_doc_url),
+        result_status=deposit_result.result_status,
+        source_type=deposit_result.source_type,
+        local_document_id=deposit_result.local_document_id,
+        has_feishu_doc=bool(deposit_result.feishu_doc_url),
     )
-    lines = [result.message, f"来源类型：{result.draft.source_type}"]
-    if result.feishu_doc_url:
-        lines.append(f"飞书文档：{result.feishu_doc_url}")
-    if result.wiki_node_token:
-        lines.append(f"Wiki 节点：{result.wiki_node_token}")
-    return "\n".join(lines)
+    return render_deposit_result_text(deposit_result)
 
 
 def _build_chat_model(settings: Settings) -> Any:

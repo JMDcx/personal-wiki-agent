@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,10 @@ from multimodal_rag_agent.rag_query_pipeline.query_understand_prompts import (
     QUERY_UNDERSTAND_SYSTEM_PROMPT,
     QUERY_UNDERSTAND_USER_PROMPT,
 )
+try:
+    from feishu_wiki_rag_agent.observability.events import log_event, preview_text
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from observability.events import log_event, preview_text
 
 try:
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -179,6 +184,7 @@ class QueryUnderstandService:
     def parse_output(self, raw_text: str) -> QueryUnderstandResult:
         content = (raw_text or "").strip()
         if not content:
+            self._log_schema_warning("empty_output", raw_output=raw_text)
             return QueryUnderstandResult(rewrite_query="", intent=DEFAULT_INTENT, image_description="", raw_output="")
 
         parsed = self._try_parse_json(content)
@@ -189,6 +195,7 @@ class QueryUnderstandService:
                 parsed = self._try_parse_json(content[start : end + 1])
 
         if parsed is None:
+            self._log_schema_warning("json_parse_failed", raw_output=content)
             return QueryUnderstandResult(
                 rewrite_query=content,
                 intent=DEFAULT_INTENT,
@@ -203,7 +210,14 @@ class QueryUnderstandService:
             or parsed.get("question")
             or ""
         ).strip()
-        intent = self._normalize_intent(parsed.get("intent"))
+        raw_intent = parsed.get("intent")
+        intent = self._normalize_intent(raw_intent)
+        if str(raw_intent or "").strip() and intent == DEFAULT_INTENT and str(raw_intent).strip() != DEFAULT_INTENT:
+            self._log_schema_warning(
+                "invalid_intent",
+                raw_output=content,
+                original_intent=str(raw_intent).strip(),
+            )
         image_description = self.merge_image_desc_and_ocr(
             str(
                 parsed.get("image_description")
@@ -258,6 +272,12 @@ class QueryUnderstandService:
         raw_output = self._extract_text(response)
         parsed = self.parse_output(raw_output)
         rewrite_query = parsed.rewrite_query or query.strip()
+        if not parsed.rewrite_query.strip():
+            self._log_schema_warning(
+                "missing_rewrite_query",
+                raw_output=raw_output,
+                fallback_query=preview_text(query),
+            )
         image_description = parsed.image_description if images else ""
         return QueryUnderstandResult(
             rewrite_query=rewrite_query,
@@ -344,3 +364,13 @@ class QueryUnderstandService:
         if value in VALID_INTENTS:
             return value  # type: ignore[return-value]
         return DEFAULT_INTENT
+
+    @staticmethod
+    def _log_schema_warning(reason: str, **fields: object) -> None:
+        log_event(
+            "schema_normalization_warning",
+            level=logging.WARNING,
+            schema_stage="query_understand",
+            reason=reason,
+            **fields,
+        )
