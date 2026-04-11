@@ -51,6 +51,7 @@ class AnswerGenerator:
             answer = str(getattr(result, "content", "") or "").strip() or EMPTY_ANSWER
             elapsed_ms = (perf_counter() - started_at) * 1000
             record_request_timing("llm_ms", elapsed_ms)
+            record_request_timing("generation_ms", elapsed_ms)
             update_request_state(answer_length=len(answer))
             log_event(
                 "generation_completed",

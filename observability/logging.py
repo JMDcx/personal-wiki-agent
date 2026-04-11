@@ -369,7 +369,16 @@ class ConsoleFormatter(logging.Formatter):
             intent = str(payload.get("intent", "") or "-")
             channel = str(payload.get("channel", "") or "-")
             parts.extend([f"status={status}", f"channel={channel}", f"intent={intent}", f"req={request_id}"])
-            for key in ("total_ms", "intent_ms", "retrieval_ms", "llm_ms", "reply_ms"):
+            for key in (
+                "total_ms",
+                "intent_ms",
+                "history_ms",
+                "intent_model_ms",
+                "retrieval_ms",
+                "generation_ms",
+                "llm_ms",
+                "reply_ms",
+            ):
                 if key in payload:
                     parts.append(f"{key}={payload[key]}")
             if "question_preview" in payload:

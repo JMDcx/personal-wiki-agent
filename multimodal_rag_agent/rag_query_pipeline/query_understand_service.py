@@ -299,16 +299,26 @@ class QueryUnderstandService:
             content.append({"type": "image_url", "image_url": {"url": data_uri}})
         return content
 
+    def _thinking_extra_body(self, model_name: str) -> dict[str, Any] | None:
+        if "qwen" not in model_name.lower():
+            return None
+        # Keep intent classification in fast non-thinking mode for Qwen-compatible providers.
+        return {"enable_thinking": self.settings.query_understand_enable_thinking}
+
     def _default_model_factory(self, config: ModelConfig, temperature: float, max_tokens: int) -> Any:
         if ChatOpenAI is None:  # pragma: no cover - local fallback
             msg = "langchain_openai is required to run QueryUnderstandService."
             raise RuntimeError(msg)
+        extra_body = self._thinking_extra_body(config.model)
         return ChatOpenAI(
             model=config.model,
             api_key=config.api_key or None,
             base_url=config.base_url or None,
             temperature=temperature,
             max_tokens=max_tokens,
+            timeout=self.settings.query_understand_timeout_seconds,
+            max_retries=self.settings.query_understand_max_retries,
+            extra_body=extra_body,
         )
 
     @staticmethod

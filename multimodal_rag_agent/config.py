@@ -17,6 +17,18 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    return float(raw) if raw else default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class MultimodalRAGSettings:
     """Runtime settings for multimodal RAG."""
@@ -86,6 +98,15 @@ class MultimodalRAGSettings:
                 os.getenv("OPENAI_BASE_URL", os.getenv("FEISHU_RAG_OPENAI_BASE_URL", "")),
             ),
         )
+    )
+    query_understand_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("MULTIMODAL_RAG_QUERY_UNDERSTAND_TIMEOUT_SECONDS", 15.0)
+    )
+    query_understand_max_retries: int = field(
+        default_factory=lambda: max(0, _env_int("MULTIMODAL_RAG_QUERY_UNDERSTAND_MAX_RETRIES", 0))
+    )
+    query_understand_enable_thinking: bool = field(
+        default_factory=lambda: _env_bool("MULTIMODAL_RAG_QUERY_UNDERSTAND_ENABLE_THINKING", False)
     )
     rerank_model: str = field(default_factory=lambda: os.getenv("MULTIMODAL_RAG_RERANK_MODEL", ""))
     rerank_api_key: str = field(default_factory=lambda: os.getenv("MULTIMODAL_RAG_RERANK_API_KEY", os.getenv("OPENAI_API_KEY", "")))

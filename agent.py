@@ -16,6 +16,7 @@ try:
     from feishu_wiki_rag_agent.observability.context import (
         bind_log_context,
         bind_request_context,
+        get_request_state,
         get_log_context,
         has_request_state,
         record_request_timing,
@@ -28,6 +29,7 @@ except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from observability.context import (
         bind_log_context,
         bind_request_context,
+        get_request_state,
         get_log_context,
         has_request_state,
         record_request_timing,
@@ -321,8 +323,11 @@ def _build_controller_context(
     chat_model_supports_vision: bool = False,
 ) -> ControllerInputContext:
     started_at = perf_counter()
+    history_started_at = perf_counter()
     history = _load_history_from_runtime(agent_runtime, thread_id)
+    history_elapsed_ms = (perf_counter() - history_started_at) * 1000
     understand_service = _create_query_understand_service(multimodal_settings)
+    understand_started_at = perf_counter()
     understand_result = understand_service.run(
         query=question,
         history=history,
@@ -331,6 +336,7 @@ def _build_controller_context(
         chat_model_supports_vision=chat_model_supports_vision,
         vlm_model=_build_vlm_model_config(multimodal_settings),
     )
+    understand_elapsed_ms = (perf_counter() - understand_started_at) * 1000
     if _is_knowledge_deposit_request(question):
         understand_result = QueryUnderstandResult(
             rewrite_query=question.strip(),
@@ -364,6 +370,8 @@ def _build_controller_context(
         ),
     )
     elapsed_ms = (perf_counter() - started_at) * 1000
+    record_request_timing("history_ms", history_elapsed_ms)
+    record_request_timing("intent_model_ms", understand_elapsed_ms)
     record_request_timing("intent_ms", elapsed_ms)
     update_request_state(
         intent=context.intent,
@@ -402,6 +410,8 @@ def _build_controller_context(
         allow_retrieval=allow_retrieval,
         image_count=len(images),
         history_turn_count=len(history),
+        history_ms=round(history_elapsed_ms, 1),
+        intent_model_ms=round(understand_elapsed_ms, 1),
         duration_ms=round(elapsed_ms, 1),
         question_preview=_question_preview(question),
     )
@@ -427,6 +437,7 @@ def search_knowledge_tool_text(
         prepared = rag_pipeline.prepare_context(query, with_sources=True)
     except Exception as exc:  # noqa: BLE001
         elapsed_ms = (perf_counter() - started_at) * 1000
+        record_request_timing("retrieval_ms", elapsed_ms)
         log_exception(
             "tool_failed",
             exc,
@@ -437,6 +448,7 @@ def search_knowledge_tool_text(
         raise
     if not prepared.merged_chunks:
         elapsed_ms = (perf_counter() - started_at) * 1000
+        record_request_timing("retrieval_ms", elapsed_ms)
         log_event(
             "tool_completed",
             tool_name="search_feishu_knowledge",
@@ -459,6 +471,7 @@ def search_knowledge_tool_text(
         )
         lines.append(source_line)
     elapsed_ms = (perf_counter() - started_at) * 1000
+    record_request_timing("retrieval_ms", elapsed_ms)
     log_event(
         "tool_completed",
         tool_name="search_feishu_knowledge",
@@ -674,6 +687,13 @@ def invoke_agent(
             )
             invoke_elapsed_ms = (perf_counter() - invoke_started_at) * 1000
             record_request_timing("llm_ms", invoke_elapsed_ms)
+            request_state = get_request_state()
+            retrieval_ms = request_state.get("timings", {}).get("retrieval_ms")
+            if isinstance(retrieval_ms, (int, float)):
+                generation_ms = max(invoke_elapsed_ms - float(retrieval_ms), 0.0)
+            else:
+                generation_ms = invoke_elapsed_ms
+            record_request_timing("generation_ms", generation_ms)
             final_text = extract_final_text(result)
             update_request_state(
                 intent=controller_context.intent,
