@@ -172,6 +172,32 @@ def _create_query_understand_service(settings: MultimodalRAGSettings | None = No
     return QueryUnderstandService(settings=settings or get_multimodal_settings())
 
 
+def _normalize_message_context(message_context: object | None) -> dict[str, object] | None:
+    if message_context is None:
+        return None
+    if isinstance(message_context, dict):
+        return message_context
+    to_dict = getattr(message_context, "to_dict", None)
+    if callable(to_dict):
+        normalized = to_dict()
+        if isinstance(normalized, dict):
+            return normalized
+    return None
+
+
+def _message_state_fields(message_context: dict[str, object] | None) -> dict[str, object]:
+    reply_context = message_context.get("reply_context", {}) if isinstance(message_context, dict) else {}
+    if not isinstance(reply_context, dict):
+        reply_context = {}
+    return {
+        "is_reply": bool(reply_context.get("is_reply")),
+        "reply_parent_id": str(reply_context.get("parent_id", "")),
+        "reply_root_id": str(reply_context.get("root_id", "")),
+        "mentioned_users": message_context.get("mentioned_users", []) if message_context else [],
+        "bot_mentioned": message_context.get("bot_mentioned", False) if message_context else False,
+    }
+
+
 def _build_checkpointer(settings: Settings) -> Any:
     db_path = str(settings.checkpoint_db_path)
     cached = _CHECKPOINTER_CACHE.get(db_path)
@@ -315,7 +341,7 @@ def _build_controller_context(
     question: str,
     thread_id: str,
     images: list[str],
-    message_context: dict[str, object] | None,
+    message_context: object | None,
     language: str,
     settings: Settings,
     multimodal_settings: MultimodalRAGSettings,
@@ -323,6 +349,7 @@ def _build_controller_context(
     chat_model_supports_vision: bool = False,
 ) -> ControllerInputContext:
     started_at = perf_counter()
+    normalized_message_context = _normalize_message_context(message_context)
     history_started_at = perf_counter()
     history = _load_history_from_runtime(agent_runtime, thread_id)
     history_elapsed_ms = (perf_counter() - history_started_at) * 1000
@@ -351,7 +378,7 @@ def _build_controller_context(
         history=history,
         allow_retrieval=allow_retrieval,
         images=images,
-        message_context=message_context,
+        message_context=normalized_message_context,
     )
     current_time = datetime.now().isoformat(timespec="seconds")
     context = ControllerInputContext(
@@ -379,29 +406,7 @@ def _build_controller_context(
         question_preview=_question_preview(question),
         history_turn_count=len(history),
         image_count=len(images),
-        is_reply=(
-            bool(message_context.get("reply_context", {}).get("is_reply"))
-            if isinstance(message_context.get("reply_context"), dict)
-            else False
-        )
-        if message_context
-        else False,
-        reply_parent_id=(
-            str(message_context.get("reply_context", {}).get("parent_id", ""))
-            if isinstance(message_context.get("reply_context"), dict)
-            else ""
-        )
-        if message_context
-        else "",
-        reply_root_id=(
-            str(message_context.get("reply_context", {}).get("root_id", ""))
-            if isinstance(message_context.get("reply_context"), dict)
-            else ""
-        )
-        if message_context
-        else "",
-        mentioned_users=message_context.get("mentioned_users", []) if message_context else [],
-        bot_mentioned=message_context.get("bot_mentioned", False) if message_context else False,
+        **_message_state_fields(normalized_message_context),
     )
     log_event(
         "controller_context_built",
