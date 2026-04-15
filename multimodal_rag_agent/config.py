@@ -121,6 +121,12 @@ class MultimodalRAGSettings:
     retrieval_top_k: int = field(default_factory=lambda: _env_int("MULTIMODAL_RAG_TOP_K", 6))
     rerank_top_k: int = field(default_factory=lambda: _env_int("MULTIMODAL_RAG_RERANK_TOP_K", 4))
     qdrant_vector_size: int = field(default_factory=lambda: _env_int("MULTIMODAL_RAG_VECTOR_SIZE", 1536))
+    query_understand_timeout_seconds: int = field(
+        default_factory=lambda: _env_int("MULTIMODAL_RAG_QUERY_UNDERSTAND_TIMEOUT_SECONDS", 10)
+    )
+    query_understand_max_retries: int = field(
+        default_factory=lambda: _env_int("MULTIMODAL_RAG_QUERY_UNDERSTAND_MAX_RETRIES", 0)
+    )
 
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

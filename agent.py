@@ -97,6 +97,27 @@ NON_RETRIEVAL_INTENTS = {
     "knowledge_deposit",
 }
 
+_LOCAL_GREETING_TEXTS = {
+    "hi",
+    "hello",
+    "hey",
+    "你好",
+    "您好",
+    "哈喽",
+    "嗨",
+    "thanks",
+    "thankyou",
+    "谢谢",
+    "多谢",
+    "感谢",
+    "bye",
+    "goodbye",
+    "再见",
+    "拜拜",
+    "回头见",
+}
+_LOCAL_INTENT_NORMALIZER_RE = re.compile(r"[\s\.,，。!！?？~～、…]+")
+
 DEPOSIT_TRIGGER_PATTERN = re.compile(r"(沉淀到知识库|沉淀到库|保存到知识库|收录到知识库|入库|沉淀一下|归档到知识库)")
 
 _AGENT_RUNTIME_CACHE: dict[tuple[str, str, str, str], Any] = {}
@@ -106,6 +127,23 @@ _CHECKPOINTER_CONTEXTS: dict[str, Any] = {}
 
 def _question_preview(text: str, limit: int = 80) -> str:
     return preview_text(text, limit=limit)
+
+
+def _maybe_fast_path_query_understand(question: str, images: list[str]) -> QueryUnderstandResult | None:
+    if images:
+        return None
+    stripped = str(question or "").strip()
+    if not stripped or len(stripped) > 16:
+        return None
+    normalized = _LOCAL_INTENT_NORMALIZER_RE.sub("", stripped).lower()
+    if normalized not in _LOCAL_GREETING_TEXTS:
+        return None
+    return QueryUnderstandResult(
+        rewrite_query=stripped,
+        intent="greeting",
+        image_description="",
+        raw_output='{"source":"local_fast_path","intent":"greeting"}',
+    )
 
 
 @dataclass(slots=True)
@@ -409,15 +447,24 @@ def _build_controller_context(
     started_at = perf_counter()
     normalized_message_context = _normalize_message_context(message_context)
     history = _load_history_from_runtime(agent_runtime, thread_id)
-    understand_service = _create_query_understand_service(multimodal_settings)
-    understand_result = understand_service.run(
-        query=question,
-        history=history,
-        images=images,
-        language=language,
-        chat_model_supports_vision=chat_model_supports_vision,
-        vlm_model=_build_vlm_model_config(multimodal_settings),
-    )
+    understand_result = _maybe_fast_path_query_understand(question, images)
+    if understand_result is not None:
+        log_event(
+            "query_understand_fast_path_hit",
+            thread_id=thread_id,
+            intent=understand_result.intent,
+            question_preview=_question_preview(question),
+        )
+    else:
+        understand_service = _create_query_understand_service(multimodal_settings)
+        understand_result = understand_service.run(
+            query=question,
+            history=history,
+            images=images,
+            language=language,
+            chat_model_supports_vision=chat_model_supports_vision,
+            vlm_model=_build_vlm_model_config(multimodal_settings),
+        )
     if _is_knowledge_deposit_request(question):
         understand_result = QueryUnderstandResult(
             rewrite_query=question.strip(),
