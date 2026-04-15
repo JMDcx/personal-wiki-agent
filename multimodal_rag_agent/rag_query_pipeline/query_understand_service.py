@@ -323,12 +323,22 @@ class QueryUnderstandService:
         if ChatOpenAI is None:  # pragma: no cover - local fallback
             msg = "langchain_openai is required to run QueryUnderstandService."
             raise RuntimeError(msg)
+        log_event(
+            "query_understand_model_selected",
+            model=config.model,
+            has_base_url=bool(config.base_url),
+            max_tokens=max_tokens,
+            request_timeout=self.settings.query_understand_timeout_seconds,
+            max_retries=self.settings.query_understand_max_retries,
+        )
         return ChatOpenAI(
             model=config.model,
             api_key=config.api_key or None,
             base_url=config.base_url or None,
             temperature=temperature,
             max_tokens=max_tokens,
+            request_timeout=self.settings.query_understand_timeout_seconds,
+            max_retries=self.settings.query_understand_max_retries,
         )
 
     @staticmethod

@@ -5,9 +5,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import os
 import re
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from time import perf_counter
 from typing import Callable
 
@@ -47,6 +50,66 @@ logging.getLogger("Lark").setLevel(logging.WARNING)
 MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
 
 
+@dataclass
+class SingleInstanceGuard:
+    """Best-effort file lock so only one Feishu channel process consumes events."""
+
+    lock_path: Path
+    _acquired: bool = False
+
+    def acquire(self) -> None:
+        if self._acquired:
+            return
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if self._clear_stale_lock():
+                    continue
+                msg = f"Feishu channel is already running: {self.lock_path}"
+                raise RuntimeError(msg)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+            self._acquired = True
+            return
+
+    def release(self) -> None:
+        if not self._acquired:
+            return
+        with suppress(FileNotFoundError):
+            self.lock_path.unlink()
+        self._acquired = False
+
+    def __enter__(self) -> SingleInstanceGuard:
+        self.acquire()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.release()
+
+    def _clear_stale_lock(self) -> bool:
+        try:
+            pid_text = self.lock_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return True
+        if pid_text.isdigit() and self._pid_is_running(int(pid_text)):
+            return False
+        with suppress(FileNotFoundError):
+            self.lock_path.unlink()
+        return True
+
+    @staticmethod
+    def _pid_is_running(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+
 def _ensure_lark_imported():
     """Import `lark_oapi` lazily."""
     global lark
@@ -84,6 +147,7 @@ class FeishuChannel:
         client: FeishuClient | None = None,
         agent_runner: Callable[[str, str, dict[str, object] | None], str] | None = None,
         deduper: MessageDeduper | None = None,
+        instance_guard: SingleInstanceGuard | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.client = client or FeishuClient(self.settings)
@@ -96,6 +160,9 @@ class FeishuChannel:
             )
         )
         self.deduper = deduper or MessageDeduper()
+        self.instance_guard = instance_guard or SingleInstanceGuard(
+            self.settings.rag_data_dir / "locks" / "feishu_channel.lock"
+        )
         self.bot_open_id: str | None = None
 
     def run(self) -> None:
@@ -108,49 +175,50 @@ class FeishuChannel:
             msg = "lark-oapi is required for websocket mode."
             raise RuntimeError(msg)
 
-        sdk = _ensure_lark_imported()
-        self.bot_open_id = self.client.fetch_bot_open_id()
-        log_event(
-            "channel_connection_connecting",
-            channel="feishu",
-            transport="websocket",
-            connection_state="connecting",
-            mode=self.settings.feishu_event_mode,
-        )
+        with self.instance_guard:
+            sdk = _ensure_lark_imported()
+            self.bot_open_id = self.client.fetch_bot_open_id()
+            log_event(
+                "channel_connection_connecting",
+                channel="feishu",
+                transport="websocket",
+                connection_state="connecting",
+                mode=self.settings.feishu_event_mode,
+            )
 
-        def handle_message(data) -> None:
-            try:
-                payload = sdk.JSON.marshal(data)
-            except Exception as exc:  # noqa: BLE001
-                with bind_log_context(channel="feishu"):
-                    log_exception(
-                        "channel_payload_marshal_failed",
-                        exc,
-                        stage="feishu_websocket_payload_marshal",
-                        channel="feishu",
-                    )
-                return
-            self._handle_websocket_payload(payload)
+            def handle_message(data) -> None:
+                try:
+                    payload = sdk.JSON.marshal(data)
+                except Exception as exc:  # noqa: BLE001
+                    with bind_log_context(channel="feishu"):
+                        log_exception(
+                            "channel_payload_marshal_failed",
+                            exc,
+                            stage="feishu_websocket_payload_marshal",
+                            channel="feishu",
+                        )
+                    return
+                self._handle_websocket_payload(payload)
 
-        event_handler = (
-            sdk.EventDispatcherHandler.builder("", "")
-            .register_p2_im_message_receive_v1(handle_message)
-            .build()
-        )
-        websocket_client = sdk.ws.Client(
-            self.settings.feishu_app_id,
-            self.settings.feishu_app_secret,
-            event_handler=event_handler,
-            log_level=sdk.LogLevel.WARNING,
-        )
-        websocket_client.start()
-        log_event(
-            "channel_connection_closed",
-            level=logging.WARNING,
-            channel="feishu",
-            transport="websocket",
-            connection_state="closed",
-        )
+            event_handler = (
+                sdk.EventDispatcherHandler.builder("", "")
+                .register_p2_im_message_receive_v1(handle_message)
+                .build()
+            )
+            websocket_client = sdk.ws.Client(
+                self.settings.feishu_app_id,
+                self.settings.feishu_app_secret,
+                event_handler=event_handler,
+                log_level=sdk.LogLevel.WARNING,
+            )
+            websocket_client.start()
+            log_event(
+                "channel_connection_closed",
+                level=logging.WARNING,
+                channel="feishu",
+                transport="websocket",
+                connection_state="closed",
+            )
 
     def _handle_websocket_payload(self, payload: str) -> None:
         """Decode one websocket callback payload and keep failures structured."""
