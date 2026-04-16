@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import logging
 import re
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from time import perf_counter
@@ -125,10 +126,25 @@ DEPOSIT_TRIGGER_PATTERN = re.compile(r"(沉淀到知识库|沉淀到库|保存�
 _AGENT_RUNTIME_CACHE: dict[tuple[str, str, str, str], Any] = {}
 _CHECKPOINTER_CACHE: dict[str, Any] = {}
 _CHECKPOINTER_CONTEXTS: dict[str, Any] = {}
+_LEGACY_FEISHU_CLEANUP_CACHE: set[str] = set()
+
+_RUNTIME_METADATA_HEADER = "[Runtime Metadata - for assistant control, not for direct user display]"
+_CURRENT_USER_QUESTION_RE = re.compile(r"Current user question:\s*(.+)$", re.DOTALL)
+_FEISHU_THREAD_PREFIX = "feishu:"
+_FEISHU_RUNTIME_THREAD_PREFIX = "feishu__"
+_HISTORY_USER_TEXT_LIMIT = 200
+_HISTORY_ASSISTANT_TEXT_LIMIT = 400
 
 
 def _question_preview(text: str, limit: int = 80) -> str:
     return preview_text(text, limit=limit)
+
+
+def _runtime_thread_id(thread_id: str) -> str:
+    raw_thread_id = str(thread_id or "").strip()
+    if raw_thread_id.startswith(_FEISHU_THREAD_PREFIX):
+        return f"{_FEISHU_RUNTIME_THREAD_PREFIX}{raw_thread_id[len(_FEISHU_THREAD_PREFIX):]}"
+    return raw_thread_id
 
 
 def _maybe_fast_path_query_understand(question: str, images: list[str]) -> QueryUnderstandResult | None:
@@ -191,6 +207,18 @@ def _settings_cache_key(settings: Settings) -> tuple[str, str, str, str]:
         settings.chat_api_key,
         settings.chat_base_url,
         str(settings.example_dir),
+    )
+
+
+def _build_agent_backend(settings: Settings) -> Any:
+    from deepagents.backends import CompositeBackend, FilesystemBackend
+
+    history_root = settings.rag_data_dir / "conversation_history"
+    return CompositeBackend(
+        default=FilesystemBackend(root_dir=settings.example_dir, virtual_mode=True),
+        routes={
+            "/conversation_history/": FilesystemBackend(root_dir=history_root, virtual_mode=True),
+        },
     )
 
 
@@ -321,6 +349,7 @@ def _build_checkpointer(settings: Settings) -> Any:
 
 def _get_or_build_agent_runtime(settings: Settings | None = None) -> Any:
     resolved = settings or get_settings()
+    _cleanup_legacy_feishu_state(resolved)
     key = _settings_cache_key(resolved)
     runtime = _AGENT_RUNTIME_CACHE.get(key)
     if runtime is None:
@@ -363,7 +392,7 @@ def _extract_message_text(message: Any) -> str:
 def _extract_raw_messages(agent: Any, thread_id: str) -> list[dict[str, str]]:
     if not hasattr(agent, "get_state"):
         return []
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": _runtime_thread_id(thread_id)}}
     try:
         snapshot = agent.get_state(config)
     except Exception:  # noqa: BLE001
@@ -384,15 +413,51 @@ def _extract_raw_messages(agent: Any, thread_id: str) -> list[dict[str, str]]:
     return normalized
 
 
+def _extract_history_user_text(text: str) -> tuple[str, bool]:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return "", False
+    if _RUNTIME_METADATA_HEADER not in stripped:
+        return stripped, False
+    matched = _CURRENT_USER_QUESTION_RE.search(stripped)
+    if matched:
+        return matched.group(1).strip(), True
+    return stripped, True
+
+
+def _truncate_history_text(text: str, *, limit: int) -> tuple[str, bool]:
+    stripped = str(text or "").strip()
+    if len(stripped) <= limit:
+        return stripped, False
+    truncated = stripped[: max(limit - 3, 0)].rstrip()
+    if not truncated:
+        return stripped[:limit], True
+    return f"{truncated}...", True
+
+
 def _load_history_from_runtime(agent: Any, thread_id: str, limit: int = 5) -> list[HistoryTurn]:
     messages: list[tuple[str, str]] = []
+    metadata_user_count = 0
+    user_truncated_count = 0
+    assistant_truncated_count = 0
     for raw_message in _extract_raw_messages(agent, thread_id):
         role = raw_message["role"]
         text = raw_message["content"]
         if role in {"human", "user"} and text:
-            messages.append(("user", text))
+            cleaned_text, had_runtime_metadata = _extract_history_user_text(text)
+            if had_runtime_metadata:
+                metadata_user_count += 1
+            cleaned_text, was_truncated = _truncate_history_text(cleaned_text, limit=_HISTORY_USER_TEXT_LIMIT)
+            if was_truncated:
+                user_truncated_count += 1
+            if cleaned_text:
+                messages.append(("user", cleaned_text))
         elif role in {"ai", "assistant"} and text:
-            messages.append(("assistant", text))
+            cleaned_text, was_truncated = _truncate_history_text(text, limit=_HISTORY_ASSISTANT_TEXT_LIMIT)
+            if was_truncated:
+                assistant_truncated_count += 1
+            if cleaned_text:
+                messages.append(("assistant", cleaned_text))
 
     history: list[HistoryTurn] = []
     pending_user: str | None = None
@@ -403,6 +468,16 @@ def _load_history_from_runtime(agent: Any, thread_id: str, limit: int = 5) -> li
         if role == "assistant" and pending_user:
             history.append(HistoryTurn(user_question=pending_user, assistant_answer=text))
             pending_user = None
+    if metadata_user_count or user_truncated_count or assistant_truncated_count:
+        log_event(
+            "thread_history_sanitized",
+            thread_id=thread_id,
+            runtime_thread_id=_runtime_thread_id(thread_id),
+            metadata_user_count=metadata_user_count,
+            user_truncated_count=user_truncated_count,
+            assistant_truncated_count=assistant_truncated_count,
+            history_turn_count=len(history),
+        )
     return history[-limit:]
 
 
@@ -431,7 +506,53 @@ def reset_thread(thread_id: str, *, settings: Settings | None = None) -> None:
     if delete_thread is None:  # pragma: no cover - unexpected checkpointer mismatch
         msg = "Current checkpointer does not support deleting a thread."
         raise RuntimeError(msg)
-    delete_thread(thread_id)
+    delete_thread(_runtime_thread_id(thread_id))
+
+
+def _cleanup_legacy_feishu_state(settings: Settings) -> None:
+    db_path = str(settings.checkpoint_db_path.resolve())
+    if db_path in _LEGACY_FEISHU_CLEANUP_CACHE:
+        return
+
+    removed_checkpoints = 0
+    removed_writes = 0
+    if settings.checkpoint_db_path.exists():
+        try:
+            conn = sqlite3.connect(settings.checkpoint_db_path)
+            try:
+                removed_checkpoints = conn.execute(
+                    "DELETE FROM checkpoints WHERE thread_id LIKE ?",
+                    (f"{_FEISHU_THREAD_PREFIX}%",),
+                ).rowcount
+                removed_writes = conn.execute(
+                    "DELETE FROM writes WHERE thread_id LIKE ?",
+                    (f"{_FEISHU_THREAD_PREFIX}%",),
+                ).rowcount
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError:
+            removed_checkpoints = 0
+            removed_writes = 0
+
+    removed_history_file = False
+    for broken_history_path in (
+        settings.example_dir / "conversation_history" / "feishu",
+        settings.rag_data_dir / "conversation_history" / "feishu",
+    ):
+        if broken_history_path.is_file():
+            broken_history_path.unlink(missing_ok=True)
+            removed_history_file = True
+
+    _LEGACY_FEISHU_CLEANUP_CACHE.add(db_path)
+    if removed_checkpoints or removed_writes or removed_history_file:
+        log_event(
+            "legacy_feishu_state_cleaned",
+            checkpoint_db_path=db_path,
+            removed_checkpoints=removed_checkpoints,
+            removed_writes=removed_writes,
+            removed_history_file=removed_history_file,
+        )
 
 
 def _build_controller_context(
@@ -655,7 +776,6 @@ def build_agent(settings: Settings | None = None) -> Any:
     deposit_pipeline = DepositPipeline(resolved, multimodal_settings)
 
     from deepagents import create_deep_agent
-    from deepagents.backends import FilesystemBackend
     from langgraph.store.memory import InMemoryStore
 
     @tool
@@ -722,7 +842,7 @@ def build_agent(settings: Settings | None = None) -> Any:
             }
         ],
         system_prompt=render_base_controller_system_prompt("中文"),
-        backend=FilesystemBackend(root_dir=resolved.example_dir, virtual_mode=True),
+        backend=_build_agent_backend(resolved),
         skills=["/skills/"],
         memory=["/AGENTS.md"],
         checkpointer=_build_checkpointer(resolved),
@@ -777,6 +897,13 @@ def invoke_agent(
         )
         try:
             agent = _get_or_build_agent_runtime(resolved)
+            runtime_thread_id = _runtime_thread_id(thread_id)
+            if runtime_thread_id != thread_id:
+                log_event(
+                    "thread_runtime_key_mapped",
+                    thread_id=thread_id,
+                    runtime_thread_id=runtime_thread_id,
+                )
             controller_context = _build_controller_context(
                 question=question,
                 thread_id=thread_id,
@@ -796,7 +923,7 @@ def invoke_agent(
             invoke_started_at = perf_counter()
             result = agent.invoke(
                 {"messages": messages},
-                config={"configurable": {"thread_id": thread_id}},
+                config={"configurable": {"thread_id": runtime_thread_id}},
             )
             invoke_elapsed_ms = (perf_counter() - invoke_started_at) * 1000
             record_request_timing("llm_ms", invoke_elapsed_ms)
