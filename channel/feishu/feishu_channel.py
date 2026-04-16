@@ -171,6 +171,7 @@ class FeishuChannel:
             self.settings.rag_data_dir / "locks" / "feishu_channel.lock"
         )
         self.bot_open_id: str | None = None
+        self._startup_cutoff_ms: int = 0  # connection-start cutoff in epoch ms
 
     def run(self) -> None:
         """Start the websocket client and listen for Feishu messages."""
@@ -185,6 +186,9 @@ class FeishuChannel:
         with self.instance_guard:
             sdk = _ensure_lark_imported()
             self.bot_open_id = self.client.fetch_bot_open_id()
+            # Record the connection-start cutoff: messages created before this
+            # timestamp (based on message.create_time) will be silently ignored.
+            self._startup_cutoff_ms = int(time.time() * 1000)
             log_event(
                 "channel_connection_connecting",
                 channel="feishu",
@@ -354,9 +358,27 @@ class FeishuChannel:
             return None
 
         message_id = str(message.get("message_id", ""))
+        chat_id = str(message.get("chat_id", ""))
+
+        if self._startup_cutoff_ms and not self._is_after_startup_cutoff(message):
+            with bind_log_context(
+                request_id=f"feishu:{message_id}" if message_id else "",
+                thread_id=f"feishu:{chat_id}" if chat_id else "",
+                channel="feishu",
+                message_id=message_id,
+                chat_id=chat_id,
+            ):
+                log_event(
+                    "message_ignored",
+                    reason="before_startup_cutoff",
+                    channel="feishu",
+                    message_id=message_id,
+                    chat_id=chat_id,
+                )
+            return None
+
         if not message_id or not self.deduper.should_process(message_id):
             return None
-        chat_id = str(message.get("chat_id", ""))
         thread_id = f"feishu:{chat_id}" if chat_id else ""
         with bind_log_context(
             request_id=f"feishu:{message_id}",
@@ -407,6 +429,43 @@ class FeishuChannel:
                 bot_mentioned=bot_mentioned,
                 mentioned_users=mentioned_users,
             )
+
+    def _is_after_startup_cutoff(self, message: dict) -> bool:
+        """Check whether the message was created after the connection-start cutoff.
+
+        The cutoff is recorded just before the websocket connection is established.
+        Messages without a reliable ``create_time`` are logged and allowed through
+        (degraded pass) rather than silently dropped.
+        """
+        create_time_ms = self._extract_create_time_ms(message)
+        if create_time_ms is None:
+            message_id = str(message.get("message_id", ""))
+            chat_id = str(message.get("chat_id", ""))
+            log_event(
+                "startup_cutoff_degraded_pass",
+                channel="feishu",
+                message_id=message_id,
+                chat_id=chat_id,
+                reason="missing_create_time",
+            )
+            return True
+        return create_time_ms >= self._startup_cutoff_ms
+
+    @staticmethod
+    def _extract_create_time_ms(message: dict) -> int | None:
+        """Extract and normalize message.create_time to integer milliseconds."""
+        raw = message.get("create_time")
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        if value < 1_000_000_000_000:
+            value *= 1000
+        return value
 
     def _mentions_bot(self, mentions: list[dict]) -> bool:
         """Return whether the incoming group message mentioned the current bot."""
