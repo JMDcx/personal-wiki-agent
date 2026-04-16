@@ -24,3 +24,6 @@ tests/test_channel_observability.py
 tests/test_observability_logging.py
 tests/test_qdrant_index.py
 .spec-workflow/
+CLAUDE.local.md
+docs/workflows-local/
+docs/prompts-local/

@@ -679,13 +679,14 @@ def search_knowledge_tool_text(
         )
         raise
     retrieval_result = RetrievalResult.from_prepared_context(retrieval_request.query, prepared)
-    if retrieval_result.result_status == "empty":
+    if retrieval_result.match_status == "no_match":
         elapsed_ms = (perf_counter() - started_at) * 1000
         log_event(
             "tool_completed",
             tool_name="search_feishu_knowledge",
             success=True,
             result_status=retrieval_result.result_status,
+            match_status=retrieval_result.match_status,
             chunk_count=retrieval_result.chunk_count,
             source_count=retrieval_result.source_count,
             duration_ms=round(elapsed_ms, 1),
@@ -699,6 +700,7 @@ def search_knowledge_tool_text(
         tool_name="search_feishu_knowledge",
         success=True,
         result_status=retrieval_result.result_status,
+        match_status=retrieval_result.match_status,
         chunk_count=retrieval_result.chunk_count,
         source_count=retrieval_result.source_count,
         duration_ms=round(elapsed_ms, 1),
