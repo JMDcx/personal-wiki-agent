@@ -127,10 +127,15 @@ def render_controller_metadata_lines(
     return lines
 
 
+_NO_MATCH_REPLY = "当前知识库中未找到相关内容。"
+
+
 def render_retrieval_result_text(result: RetrievalResult) -> str:
     """Render retrieval results into the existing tool-facing text contract."""
+    if result.match_status == "no_match":
+        return _NO_MATCH_REPLY
     if result.result_status == "empty" or not result.context.strip():
-        return "当前索引中未找到相关内容。"
+        return _NO_MATCH_REPLY
 
     lines: list[str] = [result.context.strip()]
     if result.sources:
