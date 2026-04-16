@@ -21,6 +21,7 @@ try:
         update_request_state,
     )
     from feishu_wiki_rag_agent.observability.events import emit_request_summary, log_event, log_exception, preview_text
+    from feishu_wiki_rag_agent.observability.deepagents_middleware import AgentObservabilityMiddleware
     from feishu_wiki_rag_agent.observability.logging import configure_logging
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from config import Settings, get_settings
@@ -33,6 +34,7 @@ except ModuleNotFoundError:  # pragma: no cover - source tree fallback
         update_request_state,
     )
     from observability.events import emit_request_summary, log_event, log_exception, preview_text
+    from observability.deepagents_middleware import AgentObservabilityMiddleware
     from observability.logging import configure_logging
 try:
     from feishu_wiki_rag_agent.schemas import MessageContext
@@ -671,6 +673,23 @@ def build_agent(settings: Settings | None = None) -> Any:
             pipeline=deposit_pipeline,
         )
 
+    main_observability_middleware = AgentObservabilityMiddleware(
+        agent_name="feishu-wiki-rag-agent",
+        agent_kind="main",
+    )
+    retrieval_observability_middleware = AgentObservabilityMiddleware(
+        agent_name="knowledge_retriever",
+        agent_kind="subagent",
+        parent_agent_name="feishu-wiki-rag-agent",
+        subagent_type="knowledge_retriever",
+    )
+    deposit_observability_middleware = AgentObservabilityMiddleware(
+        agent_name="knowledge_depositor",
+        agent_kind="subagent",
+        parent_agent_name="feishu-wiki-rag-agent",
+        subagent_type="knowledge_depositor",
+    )
+
     return create_deep_agent(
         name="feishu-wiki-rag-agent",
         model=_build_chat_model(resolved),
@@ -686,6 +705,7 @@ def build_agent(settings: Settings | None = None) -> Any:
                 ),
                 "tools": [search_feishu_knowledge],
                 "skills": ["/skills/"],
+                "middleware": [retrieval_observability_middleware],
             },
             {
                 "name": "knowledge_depositor",
@@ -698,6 +718,7 @@ def build_agent(settings: Settings | None = None) -> Any:
                 ),
                 "tools": [deposit_to_feishu_knowledge],
                 "skills": ["/skills/"],
+                "middleware": [deposit_observability_middleware],
             }
         ],
         system_prompt=render_base_controller_system_prompt("中文"),
@@ -706,6 +727,7 @@ def build_agent(settings: Settings | None = None) -> Any:
         memory=["/AGENTS.md"],
         checkpointer=_build_checkpointer(resolved),
         store=InMemoryStore(),
+        middleware=[main_observability_middleware],
     )
 
 
