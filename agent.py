@@ -507,6 +507,7 @@ def _build_controller_context(
     update_request_state(
         intent=context.intent,
         allow_retrieval=controller_decision.allow_retrieval,
+        rewrite_query=controller_decision.rewrite_query,
         question_preview=_question_preview(question),
         history_turn_count=len(history),
         image_count=len(images),
@@ -517,6 +518,7 @@ def _build_controller_context(
         thread_id=thread_id,
         intent=context.intent,
         allow_retrieval=allow_retrieval,
+        rewrite_query=controller_decision.rewrite_query,
         image_count=len(images),
         history_turn_count=len(history),
         duration_ms=round(elapsed_ms, 1),

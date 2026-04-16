@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import subprocess
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -16,6 +21,18 @@ except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from config import Settings, get_settings
 
 try:
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    try:
+        from observability.events import log_event, log_exception
+    except ModuleNotFoundError:  # pragma: no cover - optional dependency fallback
+        def log_event(event: str, **_: Any) -> None:
+            return None
+
+        def log_exception(event: str, exc: BaseException, **_: Any) -> None:
+            return None
+
+try:
     from langchain_core.documents import Document
 except ModuleNotFoundError:  # pragma: no cover - local fallback
     @dataclass
@@ -23,8 +40,13 @@ except ModuleNotFoundError:  # pragma: no cover - local fallback
         page_content: str
         metadata: dict[str, Any]
 
+from multimodal_rag_agent.models import ImageRef
+
 
 SUPPORTED_DOC_TYPES = {"doc", "docx"}
+FETCHABLE_DOC_TYPES = {"docx"}
+IMAGE_TAG_RE = re.compile(r"<image\s+[^>]*token=\"(?P<token>[^\"]+)\"[^>]*/?>", re.IGNORECASE)
+WHITEBOARD_TAG_RE = re.compile(r"<whiteboard\s+[^>]*token=\"(?P<token>[^\"]+)\"[^>]*/?>", re.IGNORECASE)
 
 
 @dataclass
@@ -36,9 +58,10 @@ class _TokenCache:
 class FeishuClient:
     """Thin wrapper around the Feishu open platform APIs used by the example."""
 
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, *, cli_runner: Any | None = None):
         self.settings = settings or get_settings()
         self._token_cache = _TokenCache()
+        self.cli_runner = cli_runner or subprocess.run
 
     def _request(
         self,
@@ -237,6 +260,7 @@ class FeishuClient:
         node_token: str,
         title: str,
         source_url: str,
+        image_refs: list[ImageRef] | None = None,
     ) -> Document | None:
         """Create a LangChain document when the content is non-empty."""
         cleaned = page_content.strip()
@@ -249,21 +273,196 @@ class FeishuClient:
                 "node_token": node_token,
                 "title": title,
                 "source_url": source_url,
+                "image_refs": list(image_refs or []),
             },
         )
+
+    def _run_lark_cli(self, args: list[str], *, cwd: str | None = None) -> dict[str, Any]:
+        if not shutil.which("lark-cli"):
+            raise RuntimeError("lark-cli is not installed or not in PATH.")
+
+        profile = self.settings.feishu_lark_cli_profile.strip() or "feishu-wiki-rag-agent"
+        command = ["lark-cli", *args, "--profile", profile, "--as", "bot"]
+        result = self.cli_runner(
+            command,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=self.settings.feishu_request_timeout,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"lark-cli {' '.join(args)} failed: {detail}")
+
+        stdout = result.stdout.strip()
+        if not stdout:
+            raise RuntimeError(f"lark-cli {' '.join(args)} returned empty output.")
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return {"ok": True, "data": {"raw": stdout}}
+
+        if isinstance(payload, dict) and "ok" in payload:
+            if not payload.get("ok"):
+                error = payload.get("error") or {}
+                message = error.get("message") or stdout
+                raise RuntimeError(f"lark-cli {' '.join(args)} failed: {message}")
+            return payload
+        return {"ok": True, "data": payload}
+
+    @staticmethod
+    def _payload_data(payload: dict[str, Any]) -> dict[str, Any]:
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return data
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    def _download_cli_media_bytes(self, token: str, *, media_type: str, doc_ref: str = "") -> ImageRef | None:
+        temp_root = self.settings.rag_data_dir / "tmp" / "feishu_media"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="download-", dir=temp_root) as temp_dir:
+            output_name = token
+            args = [
+                "docs",
+                "+media-download",
+                "--token",
+                token,
+                "--output",
+                output_name,
+                "--overwrite",
+            ]
+            if media_type == "whiteboard":
+                args.extend(["--type", "whiteboard"])
+            try:
+                payload = self._run_lark_cli(args, cwd=temp_dir)
+            except Exception as exc:  # noqa: BLE001
+                log_exception(
+                    "feishu_doc_media_download_failed",
+                    exc,
+                    doc_ref=doc_ref,
+                    media_type=media_type,
+                    media_token=token,
+                )
+                raise
+            data = self._payload_data(payload)
+            saved_path = str(data.get("saved_path") or output_name).strip()
+            content_type = str(data.get("content_type") or "").strip() or "application/octet-stream"
+            path = Path(saved_path)
+            if not path.is_absolute():
+                path = Path(temp_dir) / path
+            if not path.exists():
+                log_event(
+                    "feishu_doc_media_download_completed",
+                    doc_ref=doc_ref,
+                    media_type=media_type,
+                    media_token=token,
+                    success=False,
+                    saved_path=str(path),
+                )
+                return None
+            log_event(
+                "feishu_doc_media_download_completed",
+                doc_ref=doc_ref,
+                media_type=media_type,
+                media_token=token,
+                success=True,
+                saved_path=str(path),
+                size_bytes=path.stat().st_size,
+                content_type=content_type,
+            )
+            return ImageRef(
+                filename=path.name,
+                original_ref=self._media_placeholder(token, media_type=media_type),
+                mime_type=content_type,
+                image_data=path.read_bytes(),
+            )
+
+    @staticmethod
+    def _media_placeholder(token: str, *, media_type: str) -> str:
+        prefix = "__feishu_whiteboard__" if media_type == "whiteboard" else "__feishu_image__"
+        return f"{prefix}{token}"
+
+    def _replace_media_tags_with_markdown(self, markdown: str, *, doc_ref: str = "") -> tuple[str, list[ImageRef]]:
+        image_refs: list[ImageRef] = []
+
+        def replace_image(match: re.Match[str]) -> str:
+            token = match.group("token").strip()
+            try:
+                image_ref = self._download_cli_media_bytes(token, media_type="media", doc_ref=doc_ref)
+            except RuntimeError:
+                return ""
+            if image_ref is None:
+                return ""
+            image_refs.append(image_ref)
+            return f"![]({image_ref.original_ref})"
+
+        markdown = IMAGE_TAG_RE.sub(replace_image, markdown)
+
+        def replace_whiteboard(match: re.Match[str]) -> str:
+            token = match.group("token").strip()
+            try:
+                image_ref = self._download_cli_media_bytes(token, media_type="whiteboard", doc_ref=doc_ref)
+            except RuntimeError:
+                return ""
+            if image_ref is None:
+                return ""
+            image_refs.append(image_ref)
+            return f"![]({image_ref.original_ref})"
+
+        markdown = WHITEBOARD_TAG_RE.sub(replace_whiteboard, markdown)
+        return markdown, image_refs
+
+    def get_docx_markdown_with_media(self, doc_or_url: str) -> tuple[str, list[ImageRef]]:
+        log_event(
+            "feishu_doc_media_fetch_started",
+            doc_ref=doc_or_url,
+        )
+        payload = self._run_lark_cli(
+            [
+                "docs",
+                "+fetch",
+                "--doc",
+                doc_or_url,
+                "--format",
+                "json",
+            ]
+        )
+        data = self._payload_data(payload)
+        markdown = str(data.get("markdown") or data.get("content") or data.get("raw") or "").strip()
+        if not markdown:
+            raise RuntimeError(f"Unexpected docs +fetch response for {doc_or_url}")
+        image_token_count = len(IMAGE_TAG_RE.findall(markdown))
+        whiteboard_token_count = len(WHITEBOARD_TAG_RE.findall(markdown))
+        log_event(
+            "feishu_doc_media_tokens_detected",
+            doc_ref=doc_or_url,
+            image_token_count=image_token_count,
+            whiteboard_token_count=whiteboard_token_count,
+        )
+        return self._replace_media_tags_with_markdown(markdown, doc_ref=doc_or_url)
 
     def _build_direct_document_from_token(self, token: str) -> Document | None:
         """Try to interpret a root token as a direct docx/doc token."""
         source_url = f"feishu://document/{token}"
         try:
+            markdown_content, image_refs = self.get_docx_markdown_with_media(token)
             return self._build_document(
-                page_content=self.get_docx_raw_content(token),
+                page_content=markdown_content,
                 doc_token=token,
                 node_token="",
                 title=token,
                 source_url=source_url,
+                image_refs=image_refs,
             )
-        except RuntimeError:
+        except RuntimeError as exc:
+            log_exception(
+                "feishu_doc_media_fetch_fallback",
+                exc,
+                doc_ref=token,
+                fallback="docx_raw_content",
+            )
             pass
 
         try:
@@ -309,6 +508,20 @@ class FeishuClient:
                     raw_content = self.get_docx_raw_content(obj_token)
                 elif obj_type == "doc":
                     raw_content = self.get_legacy_doc_content(obj_token)
+                image_refs: list[ImageRef] = []
+                if obj_type in FETCHABLE_DOC_TYPES:
+                    try:
+                        raw_content, image_refs = self.get_docx_markdown_with_media(obj_token)
+                    except RuntimeError as exc:
+                        log_exception(
+                            "feishu_doc_media_fetch_fallback",
+                            exc,
+                            doc_ref=obj_token,
+                            obj_type=obj_type,
+                            obj_token=obj_token,
+                            fallback="raw_content",
+                        )
+                        image_refs = []
 
                 document = self._build_document(
                     page_content=raw_content,
@@ -316,6 +529,7 @@ class FeishuClient:
                     node_token=node_token,
                     title=title,
                     source_url=source_url,
+                    image_refs=image_refs,
                 )
                 if document is not None:
                     documents.append(document)

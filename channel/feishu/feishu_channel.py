@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -15,6 +16,12 @@ from time import perf_counter
 from typing import Callable
 
 from dotenv import load_dotenv
+
+if __package__ in {None, ""}:  # pragma: no cover - script execution fallback
+    repo_root = Path(__file__).resolve().parents[2]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
 
 try:
     from feishu_wiki_rag_agent.agent import invoke_agent

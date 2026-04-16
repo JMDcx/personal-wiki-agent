@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import base64
-from pathlib import Path
-
 from openai import OpenAI
 
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
+from multimodal_rag_agent.multimodal_image_pipeline.image_payload import build_normalized_image_data_uri
 
 
 class OCRService:
@@ -36,9 +34,8 @@ class OCRService:
         return " ".join(line[1][0].strip() for line in result[0] if line and len(line) > 1 and line[1][0].strip())
 
     def _extract_with_vlm(self, image_path: str) -> str:
-        image_bytes = Path(image_path).read_bytes()
         client = OpenAI(api_key=self.settings.vlm_api_key, base_url=self.settings.vlm_base_url or None, timeout=60)
-        data_uri = f"data:image/{Path(image_path).suffix.lstrip('.') or 'png'};base64,{base64.b64encode(image_bytes).decode()}"
+        data_uri = build_normalized_image_data_uri(image_path)
         response = client.chat.completions.create(
             model=self.settings.vlm_model,
             messages=[
