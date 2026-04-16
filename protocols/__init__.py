@@ -2,16 +2,33 @@
 
 from __future__ import annotations
 
-from protocols.controller_models import ControllerDecision
-from protocols.renderers import (
-    render_controller_metadata_lines,
-    render_deposit_result_text,
-    render_message_context_lines,
-    render_mention_details,
-    render_reply_context_line,
-    render_retrieval_result_text,
-)
-from protocols.tool_models import DepositRequestContext, DepositResult, RetrievalRequest, RetrievalResult
+try:
+    from feishu_wiki_rag_agent.protocols.controller_models import ControllerDecision
+    from feishu_wiki_rag_agent.protocols.renderers import (
+        render_controller_metadata_lines,
+        render_deposit_result_text,
+        render_message_context_lines,
+        render_mention_details,
+        render_reply_context_line,
+        render_retrieval_result_text,
+    )
+    from feishu_wiki_rag_agent.protocols.tool_models import (
+        DepositRequestContext,
+        DepositResult,
+        RetrievalRequest,
+        RetrievalResult,
+    )
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from protocols.controller_models import ControllerDecision
+    from protocols.renderers import (
+        render_controller_metadata_lines,
+        render_deposit_result_text,
+        render_message_context_lines,
+        render_mention_details,
+        render_reply_context_line,
+        render_retrieval_result_text,
+    )
+    from protocols.tool_models import DepositRequestContext, DepositResult, RetrievalRequest, RetrievalResult
 
 __all__ = [
     "ControllerDecision",

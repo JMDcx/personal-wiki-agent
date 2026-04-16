@@ -105,18 +105,17 @@ class IngestPipeline:
             metadata = dict(getattr(document, "metadata", {}) or {})
             if not page_content.strip():
                 continue
+            image_refs = metadata.pop("image_refs", [])
             document_id = str(metadata.get("doc_token") or metadata.get("node_token") or uuid.uuid4().hex)
             title = str(metadata.get("title", "Untitled Document"))
             metadata.setdefault("title", title)
             metadata.setdefault("source_uri", str(metadata.get("source_url", "")))
-            results.append(
-                self.ingest_markdown(
-                    page_content,
-                    title=title,
-                    metadata=metadata,
-                    document_id=document_id,
-                )
+            parsed = ParsedDocument(
+                markdown_content=page_content,
+                image_refs=list(image_refs) if isinstance(image_refs, list) else [],
+                metadata={"title": title},
             )
+            results.append(self._ingest_parsed(document_id, parsed, metadata))
         return results
 
     def _ingest_parsed(self, document_id: str, parsed, metadata: dict[str, object]) -> IngestResult:

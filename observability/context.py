@@ -46,14 +46,11 @@ def update_request_state(**fields: object) -> None:
     current = _REQUEST_STATE.get({})
     if not current:
         return
-    merged = dict(current)
-    stored_fields = dict(current.get("fields", {}))
+    stored_fields = current.setdefault("fields", {})
     for key, value in fields.items():
         if _is_empty_value(value):
             continue
         stored_fields[key] = value
-    merged["fields"] = stored_fields
-    _REQUEST_STATE.set(merged)
 
 
 def record_request_timing(name: str, duration_ms: float) -> None:
@@ -61,11 +58,20 @@ def record_request_timing(name: str, duration_ms: float) -> None:
     current = _REQUEST_STATE.get({})
     if not current:
         return
-    merged = dict(current)
-    timings = dict(current.get("timings", {}))
+    timings = current.setdefault("timings", {})
     timings[name] = round(duration_ms, 1)
-    merged["timings"] = timings
-    _REQUEST_STATE.set(merged)
+
+
+def increment_request_counter(name: str, amount: int = 1) -> None:
+    """Increment a request-scoped integer counter."""
+    current = _REQUEST_STATE.get({})
+    if not current:
+        return
+    stored_fields = current.setdefault("fields", {})
+    existing = stored_fields.get(name, 0)
+    if not isinstance(existing, int):
+        existing = 0
+    stored_fields[name] = existing + amount
 
 
 def get_request_total_duration_ms() -> float | None:

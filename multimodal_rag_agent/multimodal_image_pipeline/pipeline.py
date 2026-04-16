@@ -10,6 +10,11 @@ from multimodal_rag_agent.multimodal_image_pipeline.caption import CaptionServic
 from multimodal_rag_agent.multimodal_image_pipeline.ocr import OCRService
 from multimodal_rag_agent.multimodal_image_pipeline.sanitizer import sanitize_ocr_text
 
+try:
+    from feishu_wiki_rag_agent.observability.events import log_event, log_exception
+except ModuleNotFoundError:  # pragma: no cover - source tree fallback
+    from observability.events import log_event, log_exception
+
 
 class MultimodalImagePipeline:
     """Create image OCR and image caption chunks."""
@@ -35,8 +40,28 @@ class MultimodalImagePipeline:
         results: list[ChunkRecord] = []
         for image in images:
             parent_chunk_id = self._find_parent_chunk(image, text_chunks)
-            ocr_text = sanitize_ocr_text(self.ocr_service.extract_text(image.stored_path))
-            caption = (self.caption_service.caption(image.stored_path) or "").strip()
+            ocr_text = ""
+            caption = ""
+            try:
+                ocr_text = sanitize_ocr_text(self.ocr_service.extract_text(image.stored_path))
+            except Exception as exc:
+                log_exception(
+                    "image_ocr_failed",
+                    exc,
+                    document_id=document_id,
+                    image_id=image.image_id,
+                    image_path=image.stored_path,
+                )
+            try:
+                caption = (self.caption_service.caption(image.stored_path) or "").strip()
+            except Exception as exc:
+                log_exception(
+                    "image_caption_failed",
+                    exc,
+                    document_id=document_id,
+                    image_id=image.image_id,
+                    image_path=image.stored_path,
+                )
             common_metadata = {
                 **document_metadata,
                 "image_id": image.image_id,
@@ -73,6 +98,13 @@ class MultimodalImagePipeline:
                         image_id=image.image_id,
                         parent_chunk_id=parent_chunk_id,
                     )
+                )
+            if not ocr_text and not caption:
+                log_event(
+                    "image_processing_skipped",
+                    document_id=document_id,
+                    image_id=image.image_id,
+                    image_path=image.stored_path,
                 )
         return results
 
