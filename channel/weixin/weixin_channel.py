@@ -99,6 +99,7 @@ class WeixinChannel:
         """Authenticate if needed and start the long-poll loop."""
         configure_logging(self.settings)
         self.api = self.api or self._build_authenticated_api()
+        self._prime_cursor()
         self._poll_loop()
 
     def handle_raw_message(self, raw_msg: dict) -> str | None:
@@ -164,6 +165,42 @@ class WeixinChannel:
                 return answer
             except Exception:  # noqa: BLE001
                 raise
+
+    def _prime_cursor(self) -> None:
+        """Drain the startup backlog to establish a cursor baseline before normal polling."""
+        assert self.api is not None
+        try:
+            response = self.api.get_updates("")
+        except Exception as exc:  # noqa: BLE001
+            log_exception(
+                "channel_startup_priming_failed",
+                exc,
+                channel="weixin",
+                stage="weixin_prime_cursor",
+            )
+            raise
+        ret = int(response.get("ret", 0) or 0)
+        errcode = int(response.get("errcode", 0) or 0)
+        if ret != 0 or errcode != 0:
+            log_event(
+                "channel_startup_priming_failed",
+                level=logging.ERROR,
+                channel="weixin",
+                ret=ret,
+                errcode=errcode,
+            )
+            msg = f"Weixin startup priming returned error: ret={ret}, errcode={errcode}"
+            raise RuntimeError(msg)
+        primed_message_count = len(response.get("msgs", []))
+        new_cursor = str(response.get("get_updates_buf", ""))
+        if new_cursor:
+            self._cursor = new_cursor
+        log_event(
+            "channel_startup_backlog_drained",
+            channel="weixin",
+            primed_message_count=primed_message_count,
+            cursor_present=bool(new_cursor),
+        )
 
     def _poll_loop(self) -> None:
         assert self.api is not None
