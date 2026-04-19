@@ -3,12 +3,49 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 
 def _normalize_text(value: object) -> str:
     return " ".join(str(value or "").split()).strip()
+
+
+_URL_TRAILING_PUNCTUATION = ")]}>,，。；;！？!?\"'`#"
+_DEPOSIT_SOURCE_URL_RE = re.compile(r"##\s*来源链接\s+(https?://\S+)", re.IGNORECASE)
+_DEPOSIT_PROVIDED_CONTENT_RE = re.compile(
+    r"##\s*原文提取内容（已提供，无需再抓取）\s*(.+)$",
+    re.DOTALL,
+)
+_URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_URL_ALLOWED_PREFIX_RE = re.compile(r"^(https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)")
+
+
+def _normalize_url_candidate(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("[") and "](" in raw and raw.endswith(")"):
+        raw = raw.split("](", 1)[1][:-1].strip()
+    raw = raw.lstrip("([<")
+    matched = _URL_ALLOWED_PREFIX_RE.match(raw)
+    if matched:
+        raw = matched.group(1)
+    while raw and raw[-1] in _URL_TRAILING_PUNCTUATION:
+        raw = raw[:-1]
+    return raw.strip()
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    seen: set[str] = set()
+    normalized_urls: list[str] = []
+    for matched in _URL_PATTERN.findall(text or ""):
+        normalized = _normalize_url_candidate(matched)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            normalized_urls.append(normalized)
+    return normalized_urls
 
 
 @dataclass(slots=True)
@@ -28,26 +65,72 @@ class DepositRequestContext:
     """Normalized deposit request inputs before calling the deposit pipeline."""
 
     text: str
+    urls: list[str] = field(default_factory=list)
+    source_url: str = ""
+    provided_content: str = ""
     image_paths: list[str] = field(default_factory=list)
     invalid_image_paths_json: bool = False
+    invalid_urls_json: bool = False
     dropped_image_path_count: int = 0
+    dropped_url_count: int = 0
 
     @classmethod
-    def from_inputs(cls, *, text: str, image_paths_json: str = "[]") -> "DepositRequestContext":
+    def from_inputs(
+        cls,
+        *,
+        text: str,
+        image_paths_json: str = "[]",
+        urls_json: str = "[]",
+        source_url: str = "",
+        provided_content: str = "",
+    ) -> "DepositRequestContext":
         try:
             parsed_paths = json.loads(image_paths_json) if image_paths_json.strip() else []
             invalid_image_paths_json = False
         except json.JSONDecodeError:
             parsed_paths = []
             invalid_image_paths_json = True
+        try:
+            parsed_urls = json.loads(urls_json) if urls_json.strip() else []
+            invalid_urls_json = False
+        except json.JSONDecodeError:
+            parsed_urls = []
+            invalid_urls_json = True
         normalized_candidates = [str(path).strip() for path in parsed_paths]
         image_paths = [path for path in normalized_candidates if path]
         dropped_image_path_count = len(normalized_candidates) - len(image_paths)
+        normalized_url_candidates = [_normalize_url_candidate(url) for url in parsed_urls]
+        urls = [url for url in normalized_url_candidates if url]
+        dropped_url_count = len(normalized_url_candidates) - len(urls)
+        normalized_text = str(text or "").strip()
+        normalized_source_url = _normalize_url_candidate(source_url)
+        if not normalized_source_url:
+            matched_source = _DEPOSIT_SOURCE_URL_RE.search(normalized_text)
+            if matched_source:
+                normalized_source_url = _normalize_url_candidate(matched_source.group(1))
+        normalized_provided_content = str(provided_content or "").strip()
+        if not normalized_provided_content:
+            matched_content = _DEPOSIT_PROVIDED_CONTENT_RE.search(normalized_text)
+            if matched_content:
+                normalized_provided_content = matched_content.group(1).strip()
+        if not normalized_provided_content and normalized_source_url and normalized_text:
+            # Treat direct tool calls that pass article markdown in `text`
+            # plus the origin link in `source_url` as caller-provided content.
+            normalized_provided_content = normalized_text
+        if normalized_source_url and normalized_source_url not in urls:
+            urls.insert(0, normalized_source_url)
+        if not urls and not normalized_provided_content:
+            urls = _extract_urls_from_text(normalized_text)
         return cls(
-            text=str(text or "").strip(),
+            text=normalized_text,
+            urls=urls,
+            source_url=normalized_source_url,
+            provided_content=normalized_provided_content,
             image_paths=image_paths,
             invalid_image_paths_json=invalid_image_paths_json,
+            invalid_urls_json=invalid_urls_json,
             dropped_image_path_count=dropped_image_path_count,
+            dropped_url_count=dropped_url_count,
         )
 
 

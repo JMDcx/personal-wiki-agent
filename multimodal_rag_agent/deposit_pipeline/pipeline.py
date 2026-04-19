@@ -20,8 +20,10 @@ from multimodal_rag_agent.deposit_pipeline.adapters import (
     GenericUrlAdapter,
     ImageAdapter,
     PlainTextAdapter,
+    ProvidedContentAdapter,
     XiaohongshuAdapter,
     extract_urls,
+    normalize_url,
 )
 from multimodal_rag_agent.deposit_pipeline.feishu_writer import FeishuDepositWriter
 from multimodal_rag_agent.deposit_pipeline.models import DepositRequest, DepositResult, KnowledgeDraft, SourceMaterial
@@ -46,6 +48,7 @@ class DepositPipeline:
         self.multimodal_settings = multimodal_settings or get_multimodal_settings()
         self.adapters = adapters or [
             XiaohongshuAdapter(self.settings),
+            ProvidedContentAdapter(),
             GenericUrlAdapter(self.multimodal_settings),
             PlainTextAdapter(),
             ImageAdapter(self.multimodal_settings),
@@ -145,14 +148,19 @@ class DepositPipeline:
             raise
 
     def _normalize_request(self, request: DepositRequest) -> DepositRequest:
-        urls = list(request.urls)
-        extracted = extract_urls(request.text)
-        for url in extracted:
-            if url not in urls:
-                urls.append(url)
+        urls: list[str] = []
+        for candidate in request.urls:
+            normalized = normalize_url(candidate)
+            if normalized and normalized not in urls:
+                urls.append(normalized)
+        if not urls and not request.provided_content.strip():
+            for url in extract_urls(request.text):
+                if url not in urls:
+                    urls.append(url)
         return DepositRequest(
             text=request.text.strip(),
             urls=urls,
+            provided_content=request.provided_content.strip(),
             image_paths=list(request.image_paths),
             target_space_id=request.target_space_id.strip(),
             target_parent_node_token=request.target_parent_node_token.strip(),

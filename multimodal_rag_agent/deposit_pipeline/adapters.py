@@ -24,6 +24,16 @@ from multimodal_rag_agent.multimodal_image_pipeline.ocr import OCRService
 
 
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+TITLE_LINE_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
+URL_TRAILING_PUNCTUATION = ")]}>,，。；;！？!?\"'`#"
+URL_ALLOWED_PREFIX_RE = re.compile(r"^(https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)")
+INVALID_PAGE_MARKERS = (
+    "参数错误",
+    "轻点两下取消赞",
+    "轻点两下取消在看",
+    "微信扫一扫",
+    "继续滑动看下一个",
+)
 
 
 class DepositSourceError(RuntimeError):
@@ -38,6 +48,55 @@ class BaseSourceAdapter(ABC):
 
     @abstractmethod
     def fetch(self, request: DepositRequest) -> SourceMaterial: ...
+
+
+def normalize_url(url: str) -> str:
+    candidate = str(url or "").strip()
+    if not candidate:
+        return ""
+    if candidate.startswith("[") and "](" in candidate and candidate.endswith(")"):
+        candidate = candidate.split("](", 1)[1][:-1].strip()
+    candidate = candidate.lstrip("([<")
+    matched = URL_ALLOWED_PREFIX_RE.match(candidate)
+    if matched:
+        candidate = matched.group(1)
+    while candidate and candidate[-1] in URL_TRAILING_PUNCTUATION:
+        candidate = candidate[:-1]
+    return candidate.strip()
+
+
+def extract_urls(text: str) -> list[str]:
+    seen: set[str] = set()
+    normalized_urls: list[str] = []
+    for matched in URL_PATTERN.findall(text or ""):
+        normalized = normalize_url(matched)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            normalized_urls.append(normalized)
+    return normalized_urls
+
+
+def extract_title_from_markdown(markdown: str, *, fallback: str = "") -> str:
+    for raw_line in str(markdown or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        matched = TITLE_LINE_RE.match(line)
+        if matched:
+            title = matched.group(1).strip()
+            if title:
+                return title
+        if not line.startswith("http://") and not line.startswith("https://"):
+            return line[:120].strip()
+    return fallback.strip()
+
+
+def is_invalid_extracted_content(markdown: str) -> bool:
+    compact = str(markdown or "").strip()
+    if not compact:
+        return True
+    hits = sum(1 for marker in INVALID_PAGE_MARKERS if marker in compact)
+    return hits >= 2
 
 
 class XiaohongshuAdapter(BaseSourceAdapter):
@@ -259,6 +318,33 @@ class XiaohongshuAdapter(BaseSourceAdapter):
         return []
 
 
+class ProvidedContentAdapter(BaseSourceAdapter):
+    """Use caller-provided markdown content directly when available."""
+
+    def can_handle(self, request: DepositRequest) -> bool:
+        return bool(request.provided_content.strip())
+
+    def fetch(self, request: DepositRequest) -> SourceMaterial:
+        content = request.provided_content.strip()
+        if is_invalid_extracted_content(content):
+            raise DepositSourceError("上游提供的正文内容疑似异常页或壳页，已拒绝沉淀。")
+        source_url = request.urls[0] if request.urls else ""
+        fallback_title = source_url or "已提供正文内容"
+        title = extract_title_from_markdown(content, fallback=fallback_title)
+        source_type = "url" if source_url else "text"
+        return SourceMaterial(
+            source_type=source_type,
+            source_uri=source_url,
+            title=title,
+            raw_markdown=content,
+            metadata={
+                "source_url": source_url,
+                "content_origin": "provided_content",
+                "provided_content_length": len(content),
+            },
+        )
+
+
 class GenericUrlAdapter(BaseSourceAdapter):
     """Use docreader to parse generic URLs including WeChat articles."""
 
@@ -273,9 +359,9 @@ class GenericUrlAdapter(BaseSourceAdapter):
         url = request.urls[0]
         parsed = self.docreader.parse(ParseRequest(url=url, title=url))
         content = parsed.markdown_content.strip()
-        if not content:
+        if not content or is_invalid_extracted_content(content):
             raise DepositSourceError(f"链接解析失败：{url}")
-        title = str(parsed.metadata.get("title") or url).strip()
+        title = str(parsed.metadata.get("title") or "").strip() or extract_title_from_markdown(content, fallback=url)
         return SourceMaterial(
             source_type="url",
             source_uri=url,
@@ -283,7 +369,11 @@ class GenericUrlAdapter(BaseSourceAdapter):
             author=str(parsed.metadata.get("author") or "").strip(),
             published_at=str(parsed.metadata.get("published_at") or "").strip(),
             raw_markdown=content,
-            metadata=dict(parsed.metadata),
+            metadata={
+                **dict(parsed.metadata),
+                "source_url": url,
+                "content_origin": "fetched_url",
+            },
         )
 
 
@@ -298,7 +388,7 @@ class PlainTextAdapter(BaseSourceAdapter):
         return SourceMaterial(
             source_type="text",
             source_uri="",
-            title=(cleaned.splitlines()[0][:40] or "用户文本输入").strip(),
+            title=(extract_title_from_markdown(cleaned, fallback="用户文本输入")[:80] or "用户文本输入").strip(),
             raw_markdown=cleaned,
             metadata={"text_length": len(cleaned)},
         )
@@ -344,7 +434,3 @@ class ImageAdapter(BaseSourceAdapter):
             raw_markdown="\n".join(sections).strip(),
             metadata={"image_paths": list(request.image_paths)},
         )
-
-
-def extract_urls(text: str) -> list[str]:
-    return URL_PATTERN.findall(text or "")

@@ -129,7 +129,7 @@ _CHECKPOINTER_CONTEXTS: dict[str, Any] = {}
 _LEGACY_FEISHU_CLEANUP_CACHE: set[str] = set()
 
 _RUNTIME_METADATA_HEADER = "[Runtime Metadata - for assistant control, not for direct user display]"
-_CURRENT_USER_QUESTION_RE = re.compile(r"Current user question:\s*(.+)$", re.DOTALL)
+_CURRENT_USER_QUESTION_RE = re.compile(r"Current user question:\s*", re.DOTALL)
 _FEISHU_THREAD_PREFIX = "feishu:"
 _FEISHU_RUNTIME_THREAD_PREFIX = "feishu__"
 _HISTORY_USER_TEXT_LIMIT = 200
@@ -283,12 +283,31 @@ def _normalize_retrieval_request(query: str) -> RetrievalRequest:
     return request
 
 
-def _normalize_deposit_request_context(*, text: str, image_paths_json: str) -> DepositRequestContext:
-    context = DepositRequestContext.from_inputs(text=text, image_paths_json=image_paths_json)
+def _normalize_deposit_request_context(
+    *,
+    text: str,
+    image_paths_json: str,
+    urls_json: str = "[]",
+    source_url: str = "",
+    provided_content: str = "",
+) -> DepositRequestContext:
+    context = DepositRequestContext.from_inputs(
+        text=text,
+        image_paths_json=image_paths_json,
+        urls_json=urls_json,
+        source_url=source_url,
+        provided_content=provided_content,
+    )
     if context.invalid_image_paths_json:
         _log_schema_warning(
             "deposit_request",
             "invalid_image_paths_json",
+            text_preview=_question_preview(context.text),
+        )
+    if context.invalid_urls_json:
+        _log_schema_warning(
+            "deposit_request",
+            "invalid_urls_json",
             text_preview=_question_preview(context.text),
         )
     if context.dropped_image_path_count:
@@ -297,6 +316,13 @@ def _normalize_deposit_request_context(*, text: str, image_paths_json: str) -> D
             "blank_image_paths_dropped",
             dropped_image_path_count=context.dropped_image_path_count,
             image_count=len(context.image_paths),
+        )
+    if context.dropped_url_count:
+        _log_schema_warning(
+            "deposit_request",
+            "blank_urls_dropped",
+            dropped_url_count=context.dropped_url_count,
+            url_count=len(context.urls),
         )
     if not context.text:
         _log_schema_warning(
@@ -419,9 +445,11 @@ def _extract_history_user_text(text: str) -> tuple[str, bool]:
         return "", False
     if _RUNTIME_METADATA_HEADER not in stripped:
         return stripped, False
-    matched = _CURRENT_USER_QUESTION_RE.search(stripped)
-    if matched:
-        return matched.group(1).strip(), True
+    matches = list(_CURRENT_USER_QUESTION_RE.finditer(stripped))
+    if matches:
+        question = stripped[matches[-1].end() :].strip()
+        if question:
+            return question, True
     return stripped, True
 
 
@@ -717,12 +745,21 @@ def deposit_knowledge_tool_text(
     text: str,
     *,
     image_paths_json: str = "[]",
+    urls_json: str = "[]",
+    source_url: str = "",
+    provided_content: str = "",
     settings: Settings | None = None,
     pipeline: DepositPipeline | None = None,
 ) -> str:
     resolved = settings or get_settings()
     deposit_pipeline = pipeline or DepositPipeline(resolved, get_multimodal_settings())
-    deposit_request_context = _normalize_deposit_request_context(text=text, image_paths_json=image_paths_json)
+    deposit_request_context = _normalize_deposit_request_context(
+        text=text,
+        image_paths_json=image_paths_json,
+        urls_json=urls_json,
+        source_url=source_url,
+        provided_content=provided_content,
+    )
     log_event(
         "tool_called",
         tool_name="deposit_to_feishu_knowledge",
@@ -733,6 +770,8 @@ def deposit_knowledge_tool_text(
         result = deposit_pipeline.run(
             DepositRequest(
                 text=deposit_request_context.text,
+                urls=list(deposit_request_context.urls),
+                provided_content=deposit_request_context.provided_content,
                 image_paths=deposit_request_context.image_paths,
             )
         )
@@ -786,11 +825,20 @@ def build_agent(settings: Settings | None = None) -> Any:
         return search_knowledge_tool_text(query, resolved, pipeline=rag_pipeline)
 
     @tool
-    def deposit_to_feishu_knowledge(text: str, image_paths_json: str = "[]") -> str:
+    def deposit_to_feishu_knowledge(
+        text: str,
+        image_paths_json: str = "[]",
+        urls_json: str = "[]",
+        source_url: str = "",
+        provided_content: str = "",
+    ) -> str:
         """Deposit provided links, text, or images into the Feishu knowledge base and local index."""
         return deposit_knowledge_tool_text(
             text,
             image_paths_json=image_paths_json,
+            urls_json=urls_json,
+            source_url=source_url,
+            provided_content=provided_content,
             settings=resolved,
             pipeline=deposit_pipeline,
         )

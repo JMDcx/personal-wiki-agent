@@ -10,6 +10,7 @@ from typing import Any
 class DepositRequest:
     text: str = ""
     urls: list[str] = field(default_factory=list)
+    provided_content: str = ""
     image_paths: list[str] = field(default_factory=list)
     target_space_id: str = ""
     target_parent_node_token: str = ""
