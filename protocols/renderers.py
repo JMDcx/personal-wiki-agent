@@ -63,6 +63,7 @@ def render_message_context_lines(message_context: MessageContext | dict[str, obj
     if message_context is None:
         return []
 
+    raw_payload = message_context if isinstance(message_context, dict) else {}
     if hasattr(message_context, "to_dict") and hasattr(message_context, "mention_refs"):
         context = message_context
     else:
@@ -77,6 +78,12 @@ def render_message_context_lines(message_context: MessageContext | dict[str, obj
     mention_details = render_mention_details([mention.to_dict() for mention in context.mention_refs])
     if mention_details:
         lines.append(f"mention_details: {mention_details}")
+    inline_images_json = str(raw_payload.get("inline_images_json", "")).strip()
+    if inline_images_json:
+        lines.append(f"inline_images_json: {inline_images_json}")
+    source_title = str(raw_payload.get("source_title", "")).strip()
+    if source_title:
+        lines.append(f"source_title: {source_title}")
     if context.reply_context is not None:
         reply_context = context.reply_context.to_dict()
         lines.append("reply_context:")

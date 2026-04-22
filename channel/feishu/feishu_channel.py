@@ -16,6 +16,7 @@ from time import perf_counter
 from typing import Callable
 
 from dotenv import load_dotenv
+import requests
 
 if __package__ in {None, ""}:  # pragma: no cover - script execution fallback
     repo_root = Path(__file__).resolve().parents[2]
@@ -27,6 +28,11 @@ try:
     from feishu_wiki_rag_agent.agent import invoke_agent
     from feishu_wiki_rag_agent.config import Settings, get_settings
     from feishu_wiki_rag_agent.channel.feishu.feishu_client import FeishuClient
+    from feishu_wiki_rag_agent.multimodal_rag_agent.deposit_pipeline.adapters import extract_urls
+    from feishu_wiki_rag_agent.multimodal_rag_agent.deposit_pipeline.models import InlineImage
+    from feishu_wiki_rag_agent.multimodal_rag_agent.docreader_service.client import DocreaderService
+    from feishu_wiki_rag_agent.multimodal_rag_agent.docreader_service.schemas import ParseRequest
+    from feishu_wiki_rag_agent.multimodal_rag_agent.models import ImageRef, ParsedDocument
     from feishu_wiki_rag_agent.observability.context import (
         bind_log_context,
         bind_request_context,
@@ -45,6 +51,11 @@ except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from agent import invoke_agent
     from config import Settings, get_settings
     from channel.feishu.feishu_client import FeishuClient
+    from multimodal_rag_agent.deposit_pipeline.adapters import extract_urls
+    from multimodal_rag_agent.deposit_pipeline.models import InlineImage
+    from multimodal_rag_agent.docreader_service.client import DocreaderService
+    from multimodal_rag_agent.docreader_service.schemas import ParseRequest
+    from multimodal_rag_agent.models import ImageRef, ParsedDocument
     from observability.context import bind_log_context, bind_request_context, record_request_timing, update_request_state
     from observability.events import emit_request_summary, log_event, log_exception, preview_text
     from observability.logging import configure_logging
@@ -166,6 +177,7 @@ class FeishuChannel:
                 message_context=message_context,
             )
         )
+        self.docreader = DocreaderService()
         self.deduper = deduper or MessageDeduper()
         self.instance_guard = instance_guard or SingleInstanceGuard(
             self.settings.rag_data_dir / "locks" / "feishu_channel.lock"
@@ -318,7 +330,8 @@ class FeishuChannel:
                 text_preview=preview_text(incoming.text),
             )
             try:
-                answer = self.agent_runner(incoming.text, thread_id, incoming.to_message_context())
+                agent_text, message_context = self._build_agent_turn(incoming)
+                answer = self.agent_runner(agent_text, thread_id, message_context)
                 reply_started_at = perf_counter()
                 self.client.reply_text(incoming.message_id, answer)
                 reply_elapsed_ms = (perf_counter() - reply_started_at) * 1000
@@ -349,6 +362,120 @@ class FeishuChannel:
                 )
                 emit_request_summary(status="error", level=logging.ERROR, stage="feishu_handle_event")
                 return None
+
+    def _build_agent_turn(self, incoming: IncomingMessage) -> tuple[str, dict[str, object]]:
+        message_context = incoming.to_message_context()
+        urls = extract_urls(incoming.text)
+        if not urls:
+            return incoming.text, message_context
+
+        link_contexts: list[tuple[str, str]] = []
+        inline_images: list[InlineImage] = []
+        source_title = ""
+        for url in urls:
+            parsed = self._parse_url(url)
+            link_contexts.append((url, parsed.markdown_content.strip()))
+            if not source_title:
+                source_title = str(parsed.metadata.get("title", "")).strip()
+            inline_images.extend(self._persist_inline_images(incoming.message_id, "link", url, parsed.image_refs))
+
+        effective_question = self._strip_urls_from_text(incoming.text) or "请根据我提供的链接内容完成处理。"
+        rendered = self._render_attachment_prompt(
+            original_text=incoming.raw_text,
+            user_question=effective_question,
+            link_contexts=link_contexts,
+        )
+        return rendered, {
+            **message_context,
+            "source_title": source_title,
+            "inline_images_json": json.dumps([image.to_dict() for image in inline_images], ensure_ascii=False),
+        }
+
+    def _parse_url(self, url: str) -> ParsedDocument:
+        parsed = self.docreader.parse(ParseRequest(url=url, title=url))
+        if not parsed.markdown_content.strip():
+            raise RuntimeError(f"链接解析失败：{url}")
+        return parsed
+
+    def _persist_inline_images(
+        self,
+        message_id: str,
+        source_kind: str,
+        source_label: str,
+        image_refs: list[ImageRef],
+    ) -> list[InlineImage]:
+        persisted_images: list[InlineImage] = []
+        for index, image_ref in enumerate(image_refs):
+            image_data = image_ref.image_data or self._download_remote_image_ref(image_ref)
+            if not image_data:
+                continue
+            suffix = Path(image_ref.filename).suffix or ".png"
+            file_name = f"{message_id}_{source_kind}_{index}{suffix}"
+            save_path = self.settings.weixin_tmp_dir / file_name
+            save_path.write_bytes(image_data)
+            persisted_images.append(
+                InlineImage(
+                    placeholder="",
+                    image_path=str(save_path),
+                    original_ref=image_ref.original_ref,
+                    order=index,
+                )
+            )
+            log_event(
+                "attachment_image_saved",
+                level=logging.DEBUG,
+                channel="feishu",
+                source_kind=source_kind,
+                source_label=source_label,
+                save_path=str(save_path),
+            )
+        return persisted_images
+
+    def _download_remote_image_ref(self, image_ref: ImageRef) -> bytes:
+        original_ref = str(image_ref.original_ref or "").strip()
+        if not original_ref.startswith(("http://", "https://")):
+            return b""
+        response = requests.get(original_ref, timeout=self.settings.feishu_request_timeout)
+        response.raise_for_status()
+        return response.content
+
+    @staticmethod
+    def _strip_urls_from_text(text: str) -> str:
+        normalized = re.sub(r"https?://[^\s]+", " ", text or "")
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    @staticmethod
+    def _render_attachment_prompt(
+        *,
+        original_text: str,
+        user_question: str,
+        link_contexts: list[tuple[str, str]],
+    ) -> str:
+        lines = [
+            "以下是用户在本轮消息中附带的材料，请优先基于这些材料回答。",
+            "如果回答主要依据以下链接或文件，请在结尾使用“来源：”并写明对应链接或文件名。",
+            "",
+        ]
+        for url, content in link_contexts:
+            lines.extend(
+                [
+                    "[来源类型] 链接",
+                    f"[来源标识] {url}",
+                    "[提取内容]",
+                    content,
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+                "[用户原始消息]",
+                original_text.strip(),
+                "",
+                "[用户问题]",
+                user_question.strip(),
+            ]
+        )
+        return "\n".join(lines).strip()
 
     def _parse_incoming_message(self, event: dict) -> IncomingMessage | None:
         """Convert a raw Feishu event into the local message schema."""

@@ -11,7 +11,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from observability.events import log_event, log_exception
 
-from multimodal_rag_agent.models import ParsedDocument
+from multimodal_rag_agent.models import ImageRef, ParsedDocument
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
 from multimodal_rag_agent.docreader_service.client import DocreaderService
 from multimodal_rag_agent.docreader_service.schemas import ParseRequest
@@ -88,8 +88,13 @@ class IngestPipeline:
         metadata: dict[str, object] | None = None,
         document_id: str | None = None,
     ) -> IngestResult:
-        parsed = ParsedDocument(markdown_content=markdown_content, metadata={"title": title})
-        return self._ingest_parsed(document_id or uuid.uuid4().hex, parsed, metadata or {})
+        merged_metadata = dict(metadata or {})
+        parsed = ParsedDocument(
+            markdown_content=markdown_content,
+            image_refs=self._build_image_refs_from_paths(merged_metadata.get("image_paths")),
+            metadata={"title": title},
+        )
+        return self._ingest_parsed(document_id or uuid.uuid4().hex, parsed, merged_metadata)
 
     def ingest_documents(
         self,
@@ -170,3 +175,35 @@ class IngestPipeline:
                 duration_ms=round(elapsed_ms, 1),
             )
             raise
+
+    @staticmethod
+    def _build_image_refs_from_paths(image_paths: object) -> list[ImageRef]:
+        if not isinstance(image_paths, list):
+            return []
+        image_refs: list[ImageRef] = []
+        for image_path in image_paths:
+            if not isinstance(image_path, str) or not image_path.strip():
+                continue
+            path = Path(image_path)
+            if not path.exists() or not path.is_file():
+                continue
+            image_refs.append(
+                ImageRef(
+                    filename=path.name,
+                    original_ref=str(path),
+                    mime_type=IngestPipeline._guess_mime(path),
+                    image_data=path.read_bytes(),
+                )
+            )
+        return image_refs
+
+    @staticmethod
+    def _guess_mime(path: Path) -> str:
+        return {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".bmp": "image/bmp",
+            ".webp": "image/webp",
+        }.get(path.suffix.lower(), "application/octet-stream")

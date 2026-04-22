@@ -85,7 +85,10 @@ class ImageResolver:
             image_name = getattr(ref, "filename", image_name)
         elif original_ref.startswith("data:image/"):
             inferred_source_type = "data_uri"
-            mime_type, content = self._decode_data_uri(original_ref)
+            try:
+                mime_type, content = self._decode_data_uri(original_ref)
+            except (ValueError, base64.binascii.Error):
+                return None
             image_name = f"{uuid.uuid4().hex}{self._suffix_from_mime(mime_type)}"
         elif original_ref.startswith("http://") or original_ref.startswith("https://"):
             inferred_source_type = "remote_url"
@@ -108,6 +111,8 @@ class ImageResolver:
 
     @staticmethod
     def _decode_data_uri(data_uri: str) -> tuple[str, bytes]:
+        if "," not in data_uri:
+            raise ValueError("invalid data URI image payload")
         header, payload = data_uri.split(",", 1)
         mime_type = header.split(";")[0].removeprefix("data:")
         return mime_type, base64.b64decode(payload)

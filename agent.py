@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import re
 import sqlite3
@@ -134,6 +135,7 @@ _FEISHU_THREAD_PREFIX = "feishu:"
 _FEISHU_RUNTIME_THREAD_PREFIX = "feishu__"
 _HISTORY_USER_TEXT_LIMIT = 200
 _HISTORY_ASSISTANT_TEXT_LIMIT = 400
+_KNOWLEDGE_DEPOSIT_HISTORY_LIMIT = 5
 
 
 def _question_preview(text: str, limit: int = 80) -> str:
@@ -162,6 +164,48 @@ def _maybe_fast_path_query_understand(question: str, images: list[str]) -> Query
         image_description="",
         raw_output='{"source":"local_fast_path","intent":"greeting"}',
     )
+
+
+def _should_skip_images_for_query_understand(question: str, images: list[str]) -> bool:
+    if not images:
+        return False
+    stripped = str(question or "").strip()
+    if not stripped or not _is_knowledge_deposit_request(stripped):
+        return False
+    return (
+        "[来源类型] 链接" in stripped
+        or "http://" in stripped
+        or "https://" in stripped
+        or "mp.weixin.qq.com" in stripped
+    )
+
+
+def _trim_history_for_controller(intent: str, history: list[HistoryTurn]) -> list[HistoryTurn]:
+    if intent != "knowledge_deposit":
+        return history
+    return history[-_KNOWLEDGE_DEPOSIT_HISTORY_LIMIT:]
+
+
+def _should_skip_images_for_agent_invoke(intent: str, question: str, images: list[str]) -> bool:
+    if intent != "knowledge_deposit" or not images:
+        return False
+    stripped = str(question or "").strip()
+    return (
+        "[来源类型] 链接" in stripped
+        or "http://" in stripped
+        or "https://" in stripped
+        or "mp.weixin.qq.com" in stripped
+    )
+
+
+def _runtime_invoke_thread_id(base_runtime_thread_id: str, intent: str) -> str:
+    if intent != "knowledge_deposit":
+        return base_runtime_thread_id
+    request_id = str(get_log_context().get("request_id", "")).strip()
+    if not request_id:
+        return f"{base_runtime_thread_id}__deposit"
+    normalized_request_id = re.sub(r"[^A-Za-z0-9._:-]+", "_", request_id)
+    return f"{base_runtime_thread_id}__deposit__{normalized_request_id}"
 
 
 @dataclass(slots=True)
@@ -287,15 +331,19 @@ def _normalize_deposit_request_context(
     *,
     text: str,
     image_paths_json: str,
+    inline_images_json: str = "[]",
     urls_json: str = "[]",
     source_url: str = "",
+    source_title: str = "",
     provided_content: str = "",
 ) -> DepositRequestContext:
     context = DepositRequestContext.from_inputs(
         text=text,
         image_paths_json=image_paths_json,
+        inline_images_json=inline_images_json,
         urls_json=urls_json,
         source_url=source_url,
+        source_title=source_title,
         provided_content=provided_content,
     )
     if context.invalid_image_paths_json:
@@ -310,12 +358,25 @@ def _normalize_deposit_request_context(
             "invalid_urls_json",
             text_preview=_question_preview(context.text),
         )
+    if context.invalid_inline_images_json:
+        _log_schema_warning(
+            "deposit_request",
+            "invalid_inline_images_json",
+            text_preview=_question_preview(context.text),
+        )
     if context.dropped_image_path_count:
         _log_schema_warning(
             "deposit_request",
             "blank_image_paths_dropped",
             dropped_image_path_count=context.dropped_image_path_count,
             image_count=len(context.image_paths),
+        )
+    if context.dropped_inline_image_count:
+        _log_schema_warning(
+            "deposit_request",
+            "invalid_inline_images_dropped",
+            dropped_inline_image_count=context.dropped_inline_image_count,
+            inline_image_count=len(context.inline_images),
         )
     if context.dropped_url_count:
         _log_schema_warning(
@@ -598,7 +659,15 @@ def _build_controller_context(
     started_at = perf_counter()
     normalized_message_context = _normalize_message_context(message_context)
     history = _load_history_from_runtime(agent_runtime, thread_id)
-    understand_result = _maybe_fast_path_query_understand(question, images)
+    understand_images = [] if _should_skip_images_for_query_understand(question, images) else images
+    if images and not understand_images:
+        log_event(
+            "query_understand_images_skipped",
+            thread_id=thread_id,
+            image_count=len(images),
+            question_preview=_question_preview(question),
+        )
+    understand_result = _maybe_fast_path_query_understand(question, understand_images)
     if understand_result is not None:
         log_event(
             "query_understand_fast_path_hit",
@@ -611,7 +680,7 @@ def _build_controller_context(
         understand_result = understand_service.run(
             query=question,
             history=history,
-            images=images,
+            images=understand_images,
             language=language,
             chat_model_supports_vision=chat_model_supports_vision,
             vlm_model=_build_vlm_model_config(multimodal_settings),
@@ -623,19 +692,37 @@ def _build_controller_context(
             image_description=understand_result.image_description,
             raw_output=understand_result.raw_output,
         )
+    history = _trim_history_for_controller(understand_result.intent, history)
     allow_retrieval = _intent_requires_retrieval(understand_result.intent)
     controller_decision = ControllerDecision.from_query_understand(
         understand_result,
         fallback_question=question,
         allow_retrieval=allow_retrieval,
     )
+    rendered_message_context: MessageContext | dict[str, object] = normalized_message_context
+    if isinstance(message_context, dict):
+        inline_images_json = str(message_context.get("inline_images_json", "")).strip()
+        if inline_images_json:
+            rendered_message_context = {
+                **normalized_message_context.to_dict(),
+                "inline_images_json": inline_images_json,
+            }
+    agent_images = [] if _should_skip_images_for_agent_invoke(understand_result.intent, question, images) else images
+    if images and not agent_images:
+        log_event(
+            "agent_invoke_images_skipped",
+            thread_id=thread_id,
+            intent=understand_result.intent,
+            image_count=len(images),
+            question_preview=_question_preview(question),
+        )
     user_content = render_controller_user_input(
         question=question,
         understand_result=understand_result,
         history=history,
         allow_retrieval=controller_decision.allow_retrieval,
-        images=images,
-        message_context=normalized_message_context,
+        images=agent_images,
+        message_context=rendered_message_context,
     )
     current_time = datetime.now().isoformat(timespec="seconds")
     context = ControllerInputContext(
@@ -661,7 +748,7 @@ def _build_controller_context(
         rewrite_query=controller_decision.rewrite_query,
         question_preview=_question_preview(question),
         history_turn_count=len(history),
-        image_count=len(images),
+        image_count=len(agent_images),
         **_message_state_fields(normalized_message_context),
     )
     log_event(
@@ -670,7 +757,7 @@ def _build_controller_context(
         intent=context.intent,
         allow_retrieval=allow_retrieval,
         rewrite_query=controller_decision.rewrite_query,
-        image_count=len(images),
+        image_count=len(agent_images),
         history_turn_count=len(history),
         duration_ms=round(elapsed_ms, 1),
         question_preview=_question_preview(question),
@@ -745,8 +832,10 @@ def deposit_knowledge_tool_text(
     text: str,
     *,
     image_paths_json: str = "[]",
+    inline_images_json: str = "[]",
     urls_json: str = "[]",
     source_url: str = "",
+    source_title: str = "",
     provided_content: str = "",
     settings: Settings | None = None,
     pipeline: DepositPipeline | None = None,
@@ -756,8 +845,10 @@ def deposit_knowledge_tool_text(
     deposit_request_context = _normalize_deposit_request_context(
         text=text,
         image_paths_json=image_paths_json,
+        inline_images_json=inline_images_json,
         urls_json=urls_json,
         source_url=source_url,
+        source_title=source_title,
         provided_content=provided_content,
     )
     log_event(
@@ -765,14 +856,17 @@ def deposit_knowledge_tool_text(
         tool_name="deposit_to_feishu_knowledge",
         text_preview=_question_preview(deposit_request_context.text),
         image_count=len(deposit_request_context.image_paths),
+        inline_image_count=len(deposit_request_context.inline_images),
     )
     try:
         result = deposit_pipeline.run(
             DepositRequest(
                 text=deposit_request_context.text,
                 urls=list(deposit_request_context.urls),
+                source_title=deposit_request_context.source_title,
                 provided_content=deposit_request_context.provided_content,
                 image_paths=deposit_request_context.image_paths,
+                inline_images=list(deposit_request_context.inline_images),
             )
         )
     except Exception as exc:  # noqa: BLE001
@@ -782,6 +876,7 @@ def deposit_knowledge_tool_text(
             tool_name="deposit_to_feishu_knowledge",
             text_preview=_question_preview(deposit_request_context.text),
             image_count=len(deposit_request_context.image_paths),
+            inline_image_count=len(deposit_request_context.inline_images),
         )
         raise
     deposit_result = DepositResult.from_pipeline_result(result)
@@ -828,6 +923,7 @@ def build_agent(settings: Settings | None = None) -> Any:
     def deposit_to_feishu_knowledge(
         text: str,
         image_paths_json: str = "[]",
+        inline_images_json: str = "[]",
         urls_json: str = "[]",
         source_url: str = "",
         provided_content: str = "",
@@ -836,6 +932,7 @@ def build_agent(settings: Settings | None = None) -> Any:
         return deposit_knowledge_tool_text(
             text,
             image_paths_json=image_paths_json,
+            inline_images_json=inline_images_json,
             urls_json=urls_json,
             source_url=source_url,
             provided_content=provided_content,
@@ -883,7 +980,10 @@ def build_agent(settings: Settings | None = None) -> Any:
                 "system_prompt": (
                     "You are a knowledge deposit specialist. "
                     "Always call `deposit_to_feishu_knowledge` before responding. "
-                    "Use the user's full source text, and pass image_paths_json when runtime metadata contains image paths. "
+                    "Use the original extracted markdown verbatim as the deposit input when the user message already includes source material. "
+                    "Do not rewrite, summarize, compress, or paraphrase the source material before calling the deposit tool. "
+                    "Pass the full source markdown through `provided_content` when available; otherwise keep it intact inside `text`. "
+                    "Pass image_paths_json and inline_images_json when runtime metadata contains them. "
                     "Return a concise completion note with the resulting document link when available."
                 ),
                 "tools": [deposit_to_feishu_knowledge],
@@ -964,6 +1064,49 @@ def invoke_agent(
                 multimodal_settings=multimodal_settings,
                 agent_runtime=agent,
             )
+            if controller_context.intent == "knowledge_deposit":
+                raw_message_context = message_context if isinstance(message_context, dict) else {}
+                fast_path_started_at = perf_counter()
+                log_event(
+                    "knowledge_deposit_fast_path_hit",
+                    thread_id=thread_id,
+                    runtime_thread_id=runtime_thread_id,
+                    image_count=len(images or []),
+                    question_preview=_question_preview(question),
+                )
+                final_text = deposit_knowledge_tool_text(
+                    controller_context.raw_question,
+                    image_paths_json=json.dumps(list(images or []), ensure_ascii=False),
+                    inline_images_json=str(raw_message_context.get("inline_images_json", "[]") or "[]"),
+                    source_title=str(raw_message_context.get("source_title", "") or ""),
+                    settings=resolved,
+                )
+                fast_path_elapsed_ms = (perf_counter() - fast_path_started_at) * 1000
+                record_request_timing("llm_ms", fast_path_elapsed_ms)
+                update_request_state(
+                    intent=controller_context.intent,
+                    allow_retrieval=False,
+                    answer_length=len(final_text),
+                    answer_preview=_question_preview(final_text),
+                )
+                log_event(
+                    "agent_invoke_completed",
+                    intent=controller_context.intent,
+                    duration_ms=round(fast_path_elapsed_ms, 1),
+                    answer_preview=_question_preview(final_text),
+                    answer_length=len(final_text),
+                    fast_path="knowledge_deposit",
+                )
+                return final_text
+            invoke_thread_id = _runtime_invoke_thread_id(runtime_thread_id, controller_context.intent)
+            if invoke_thread_id != runtime_thread_id:
+                log_event(
+                    "agent_invoke_thread_isolated",
+                    thread_id=thread_id,
+                    runtime_thread_id=runtime_thread_id,
+                    invoke_thread_id=invoke_thread_id,
+                    intent=controller_context.intent,
+                )
 
             messages: list[dict[str, Any]] = []
             if controller_context.runtime_system_prompt:
@@ -973,7 +1116,7 @@ def invoke_agent(
             invoke_started_at = perf_counter()
             result = agent.invoke(
                 {"messages": messages},
-                config={"configurable": {"thread_id": runtime_thread_id}},
+                config={"configurable": {"thread_id": invoke_thread_id}},
             )
             invoke_elapsed_ms = (perf_counter() - invoke_started_at) * 1000
             record_request_timing("llm_ms", invoke_elapsed_ms)

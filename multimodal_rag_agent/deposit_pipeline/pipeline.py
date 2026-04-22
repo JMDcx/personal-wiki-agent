@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from time import perf_counter
 from typing import Callable
 
@@ -26,8 +27,18 @@ from multimodal_rag_agent.deposit_pipeline.adapters import (
     normalize_url,
 )
 from multimodal_rag_agent.deposit_pipeline.feishu_writer import FeishuDepositWriter
-from multimodal_rag_agent.deposit_pipeline.models import DepositRequest, DepositResult, KnowledgeDraft, SourceMaterial
+from multimodal_rag_agent.deposit_pipeline.models import (
+    DepositRequest,
+    DepositResult,
+    InlineImage,
+    KnowledgeDraft,
+    SourceMaterial,
+)
 from multimodal_rag_agent.ingest_pipeline.pipeline import IngestPipeline
+
+
+MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*]\(([^)\n]+)\)")
+INLINE_IMAGE_PLACEHOLDER_TEMPLATE = "[[IMG_{order:03d}]]"
 
 
 class DepositPipeline:
@@ -71,8 +82,29 @@ class DepositPipeline:
         )
         try:
             source = self._select_adapter(normalized).fetch(normalized)
+            if normalized.image_paths:
+                source.metadata = {
+                    **source.metadata,
+                    "image_paths": list(normalized.image_paths),
+                    "image_count": len(normalized.image_paths),
+                }
             draft = self.summarizer(source, normalized.text)
-            final_markdown = self._render_markdown(draft)
+            placeholder_markdown, inline_images = self._render_markdown(
+                draft,
+                image_paths=normalized.image_paths,
+            )
+            final_markdown = placeholder_markdown
+            ingest_markdown = self._render_ingest_markdown(placeholder_markdown, inline_images)
+            self._log_rendered_markdown(
+                event="deposit_feishu_markdown_prepared",
+                markdown_content=placeholder_markdown,
+                source_type=source.source_type,
+            )
+            self._log_rendered_markdown(
+                event="deposit_ingest_markdown_prepared",
+                markdown_content=ingest_markdown,
+                source_type=source.source_type,
+            )
 
             if not auto_write:
                 elapsed_ms = (perf_counter() - started_at) * 1000
@@ -98,12 +130,14 @@ class DepositPipeline:
 
             write_result = self.writer.write_markdown(
                 title=draft.feishu_doc_title,
-                markdown_content=final_markdown,
+                markdown_content=placeholder_markdown,
+                image_paths=list(normalized.image_paths),
+                inline_images=inline_images,
                 target_space_id=target_space_id,
                 target_parent_node_token=target_parent_node_token,
             )
             ingest_result = self.ingest_pipeline.ingest_markdown(
-                final_markdown,
+                ingest_markdown,
                 title=draft.feishu_doc_title,
                 metadata={
                     **draft.metadata,
@@ -112,6 +146,7 @@ class DepositPipeline:
                     "source_type": f"deposit:{draft.source_type}",
                     "feishu_doc_token": write_result.document_token,
                     "wiki_node_token": write_result.wiki_node_token,
+                    "image_paths": list(normalized.image_paths),
                 },
             )
             elapsed_ms = (perf_counter() - started_at) * 1000
@@ -160,8 +195,10 @@ class DepositPipeline:
         return DepositRequest(
             text=request.text.strip(),
             urls=urls,
+            source_title=request.source_title.strip(),
             provided_content=request.provided_content.strip(),
             image_paths=list(request.image_paths),
+            inline_images=list(request.inline_images),
             target_space_id=request.target_space_id.strip(),
             target_parent_node_token=request.target_parent_node_token.strip(),
             auto_write=request.auto_write,
@@ -174,12 +211,22 @@ class DepositPipeline:
         raise DepositSourceError("未识别到可沉淀的链接、文本或图片输入。")
 
     def _build_draft(self, source: SourceMaterial, user_text: str) -> KnowledgeDraft:
-        lines = [line.strip("- ").strip() for line in source.raw_markdown.splitlines() if line.strip()]
-        key_points = [line for line in lines if len(line) >= 8][:5]
+        lines = self._extract_summary_candidate_lines(source.raw_markdown)
+        key_points = [line for line in lines if len(line) >= 8]
+        if source.title:
+            key_points = [source.title, *key_points]
         if not key_points:
             key_points = [source.title, source.extra_summary or source.raw_markdown[:120].strip()]
-        key_points = [point for point in key_points if point][:5]
-        summary_sentence = key_points[0] if key_points else source.title
+        deduped_key_points: list[str] = []
+        seen_points: set[str] = set()
+        for point in key_points:
+            cleaned = str(point or "").strip()
+            if not cleaned or cleaned in seen_points:
+                continue
+            seen_points.add(cleaned)
+            deduped_key_points.append(cleaned)
+        key_points = deduped_key_points[:5]
+        summary_sentence = source.title or (key_points[0] if key_points else source.title)
         summary_lines = [
             f"一句话摘要：{summary_sentence}",
             "",
@@ -200,8 +247,33 @@ class DepositPipeline:
             key_points=key_points,
             tags=tags,
             feishu_doc_title=f"[{source_type_label}] {source_title} - 沉淀",
+            inline_images=list(source.inline_images),
             metadata={**source.metadata, "deposit_generated_at": self.now_provider().isoformat(timespec="seconds")},
         )
+
+    @staticmethod
+    def _extract_summary_candidate_lines(markdown: str) -> list[str]:
+        candidates: list[str] = []
+        in_fenced_block = False
+        for raw_line in str(markdown or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("```") or line == "```":
+                in_fenced_block = not in_fenced_block
+                continue
+            if in_fenced_block:
+                continue
+            if MARKDOWN_IMAGE_RE.fullmatch(line):
+                continue
+            if line.startswith("http://") or line.startswith("https://"):
+                continue
+            compact = line.strip("- ").strip()
+            compact = re.sub(r"^\s{0,3}#{1,6}\s+", "", compact).strip()
+            if not compact:
+                continue
+            candidates.append(compact)
+        return candidates
 
     @staticmethod
     def _infer_tags(source: SourceMaterial, user_text: str, key_points: list[str]) -> list[str]:
@@ -215,18 +287,23 @@ class DepositPipeline:
             tags.append("公众号")
         return list(dict.fromkeys(tag for tag in tags if tag))
 
-    def _render_markdown(self, draft: KnowledgeDraft) -> str:
+    def _render_markdown(self, draft: KnowledgeDraft, *, image_paths: list[str]) -> tuple[str, list[InlineImage]]:
         deposited_at = self.now_provider().isoformat(timespec="seconds")
         details = "\n".join(f"- {point}" for point in draft.key_points) or "- 无"
         tags = "、".join(draft.tags) or "无"
-        return "\n".join(
+        rendered_body, inline_images = self._prepare_raw_content_with_inline_images(
+            draft.raw_content_markdown.strip() or "无",
+            draft.inline_images,
+            image_paths=image_paths,
+        )
+        markdown = "\n".join(
             [
                 f"# {draft.feishu_doc_title}",
                 "",
                 draft.summary_markdown,
                 "",
                 "## 详细整理",
-                draft.raw_content_markdown.strip() or "无",
+                rendered_body,
                 "",
                 "## 来源信息",
                 f"- 来源类型：{draft.source_type}",
@@ -245,6 +322,162 @@ class DepositPipeline:
                 "",
             ]
         ).strip()
+        return markdown, inline_images
+
+    def _render_ingest_markdown(self, markdown: str, inline_images: list[InlineImage]) -> str:
+        rendered = markdown
+        for order, image in enumerate(inline_images, start=1):
+            image_ref = image.original_ref.strip() or image.image_path.strip()
+            replacement = f"![图片{order}]({image_ref})" if image_ref else f"[图片{order}]"
+            rendered = rendered.replace(image.placeholder, replacement)
+        return rendered
+
+    def _prepare_raw_content_with_inline_images(
+        self,
+        raw_markdown: str,
+        source_inline_images: list[InlineImage],
+        *,
+        image_paths: list[str],
+    ) -> tuple[str, list[InlineImage]]:
+        normalized_paths = [str(path).strip() for path in image_paths if str(path).strip()]
+        prepared_inline_images: list[InlineImage] = []
+        path_cursor = 0
+        consumed_paths: set[str] = set()
+
+        def _next_path(preferred_path: str = "") -> str:
+            nonlocal path_cursor
+            candidate = preferred_path.strip()
+            if candidate:
+                consumed_paths.add(candidate)
+                while path_cursor < len(normalized_paths) and normalized_paths[path_cursor] in consumed_paths:
+                    path_cursor += 1
+                return candidate
+            while path_cursor < len(normalized_paths) and normalized_paths[path_cursor] in consumed_paths:
+                path_cursor += 1
+            if path_cursor >= len(normalized_paths):
+                return ""
+            candidate = normalized_paths[path_cursor]
+            consumed_paths.add(candidate)
+            path_cursor += 1
+            return candidate
+
+        ordered_source_images = [
+            InlineImage(
+                placeholder=image.placeholder,
+                image_path=image.image_path,
+                original_ref=image.original_ref,
+                order=image.order,
+            )
+            for image in source_inline_images
+        ]
+
+        def _replace_markdown_image(match: re.Match[str]) -> str:
+            image_index = len(prepared_inline_images)
+            original_ref = match.group(1).strip()
+            preferred_path = ""
+            if image_index < len(ordered_source_images):
+                preferred_path = ordered_source_images[image_index].image_path
+                if not original_ref:
+                    original_ref = ordered_source_images[image_index].original_ref
+            placeholder = INLINE_IMAGE_PLACEHOLDER_TEMPLATE.format(order=image_index + 1)
+            prepared_inline_images.append(
+                InlineImage(
+                    placeholder=placeholder,
+                    image_path=_next_path(preferred_path),
+                    original_ref=original_ref,
+                    order=image_index,
+                )
+            )
+            return f"\n\n{placeholder}\n\n"
+
+        rendered = MARKDOWN_IMAGE_RE.sub(_replace_markdown_image, raw_markdown)
+        remaining_source_images = ordered_source_images[len(prepared_inline_images) :]
+        while path_cursor < len(normalized_paths):
+            if normalized_paths[path_cursor] in consumed_paths:
+                path_cursor += 1
+                continue
+            fallback_order = len(remaining_source_images)
+            remaining_source_images.append(
+                InlineImage(
+                    placeholder="",
+                    image_path=normalized_paths[path_cursor],
+                    original_ref="",
+                    order=fallback_order,
+                )
+            )
+            path_cursor += 1
+
+        if remaining_source_images:
+            suggestions_markdown, suggestion_images = self._build_image_placement_suggestions(
+                raw_markdown=rendered,
+                pending_images=remaining_source_images,
+                start_order=len(prepared_inline_images) + 1,
+            )
+            if suggestions_markdown:
+                rendered = f"{rendered.strip()}\n\n{suggestions_markdown}".strip()
+                prepared_inline_images.extend(suggestion_images)
+
+        return rendered.strip(), prepared_inline_images
+
+    def _build_image_placement_suggestions(
+        self,
+        *,
+        raw_markdown: str,
+        pending_images: list[InlineImage],
+        start_order: int,
+    ) -> tuple[str, list[InlineImage]]:
+        if not pending_images:
+            return "", []
+
+        anchors = self._collect_image_placement_anchors(raw_markdown)
+        suggestion_lines = ["## 图片放置建议"]
+        suggestion_images: list[InlineImage] = []
+        for offset, image in enumerate(pending_images):
+            placeholder = INLINE_IMAGE_PLACEHOLDER_TEMPLATE.format(order=start_order + offset)
+            anchor = anchors[min(offset, len(anchors) - 1)] if anchors else "正文对应位置附近"
+            suggestion_lines.append(f"- {placeholder} 建议放在{anchor}")
+            suggestion_images.append(
+                InlineImage(
+                    placeholder=placeholder,
+                    image_path=image.image_path,
+                    original_ref=image.original_ref,
+                    order=start_order + offset - 1,
+                )
+            )
+        return "\n".join(suggestion_lines), suggestion_images
+
+    @staticmethod
+    def _collect_image_placement_anchors(raw_markdown: str) -> list[str]:
+        anchors: list[str] = []
+        seen: set[str] = set()
+        blocks = [block.strip() for block in re.split(r"\n\s*\n", raw_markdown or "") if block.strip()]
+        for block in blocks:
+            if MARKDOWN_IMAGE_RE.search(block):
+                continue
+            heading_match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", block)
+            if heading_match:
+                anchor = f"“{heading_match.group(1).strip()}”后"
+            else:
+                compact = re.sub(r"\s+", " ", block).strip("- ").strip()
+                if not compact:
+                    continue
+                snippet = compact[:24]
+                anchor = f"“{snippet}”后"
+            if anchor not in seen:
+                seen.add(anchor)
+                anchors.append(anchor)
+        return anchors or ["正文对应位置附近"]
+
+    @staticmethod
+    def _log_rendered_markdown(*, event: str, markdown_content: str, source_type: str) -> None:
+        log_event(
+            event,
+            source_type=source_type,
+            markdown_length=len(markdown_content),
+            markdown_preview=preview_text(markdown_content, limit=800),
+            placeholder_count=markdown_content.count("[[IMG_"),
+            markdown_image_count=len(MARKDOWN_IMAGE_RE.findall(markdown_content)),
+        )
 
     @staticmethod
     def _source_type_label(source_type: str) -> str:

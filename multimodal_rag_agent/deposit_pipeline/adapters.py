@@ -16,7 +16,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from config import Settings, get_settings
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
-from multimodal_rag_agent.deposit_pipeline.models import DepositRequest, SourceMaterial
+from multimodal_rag_agent.deposit_pipeline.models import DepositRequest, InlineImage, SourceMaterial
 from multimodal_rag_agent.docreader_service.client import DocreaderService
 from multimodal_rag_agent.docreader_service.schemas import ParseRequest
 from multimodal_rag_agent.multimodal_image_pipeline.caption import CaptionService
@@ -25,6 +25,7 @@ from multimodal_rag_agent.multimodal_image_pipeline.ocr import OCRService
 
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 TITLE_LINE_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
+MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*]\(([^)\n]+)\)")
 URL_TRAILING_PUNCTUATION = ")]}>,，。；;！？!?\"'`#"
 URL_ALLOWED_PREFIX_RE = re.compile(r"^(https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)")
 INVALID_PAGE_MARKERS = (
@@ -77,9 +78,17 @@ def extract_urls(text: str) -> list[str]:
 
 
 def extract_title_from_markdown(markdown: str, *, fallback: str = "") -> str:
+    in_fenced_block = False
     for raw_line in str(markdown or "").splitlines():
         line = raw_line.strip()
         if not line:
+            continue
+        if line.startswith("```") or line == "```":
+            in_fenced_block = not in_fenced_block
+            continue
+        if in_fenced_block:
+            continue
+        if MARKDOWN_IMAGE_RE.fullmatch(line):
             continue
         matched = TITLE_LINE_RE.match(line)
         if matched:
@@ -95,8 +104,85 @@ def is_invalid_extracted_content(markdown: str) -> bool:
     compact = str(markdown or "").strip()
     if not compact:
         return True
-    hits = sum(1 for marker in INVALID_PAGE_MARKERS if marker in compact)
-    return hits >= 2
+    hits = [marker for marker in INVALID_PAGE_MARKERS if marker in compact]
+    if len(hits) < 2:
+        return False
+    if "参数错误" in compact[:200]:
+        return True
+
+    marker_positions = [compact.find(marker) for marker in hits]
+    tail_only_noise = marker_positions and min(marker_positions) >= int(len(compact) * 0.5)
+    looks_like_article = compact.startswith("# ") and ("http://" in compact or "https://" in compact or "![" in compact)
+    if looks_like_article and tail_only_noise:
+        return False
+
+    return True
+
+
+def _build_inline_images(
+    markdown: str,
+    *,
+    request_inline_images: list[InlineImage],
+    fallback_original_refs: list[str],
+) -> list[InlineImage]:
+    available_by_ref: dict[str, list[InlineImage]] = {}
+    for image in sorted(request_inline_images, key=lambda item: item.order):
+        key = image.original_ref.strip()
+        available_by_ref.setdefault(key, []).append(
+            InlineImage(
+                placeholder=image.placeholder,
+                image_path=image.image_path,
+                original_ref=key,
+                order=image.order,
+            )
+        )
+
+    allowed_refs = {image.original_ref.strip() for image in request_inline_images if image.original_ref.strip()}
+    markdown_refs = [match.group(1).strip() for match in MARKDOWN_IMAGE_RE.finditer(markdown or "")]
+    if allowed_refs:
+        markdown_refs = [ref for ref in markdown_refs if ref in allowed_refs]
+    refs = markdown_refs or [ref for ref in fallback_original_refs if not allowed_refs or ref in allowed_refs]
+
+    inline_images: list[InlineImage] = []
+    consumed_paths: set[str] = set()
+    for order, original_ref in enumerate(refs):
+        matched = None
+        candidates = available_by_ref.get(original_ref, [])
+        if candidates:
+            matched = candidates.pop(0)
+            if matched.image_path:
+                consumed_paths.add(matched.image_path)
+        inline_images.append(
+            InlineImage(
+                placeholder=matched.placeholder if matched else "",
+                image_path=matched.image_path if matched else "",
+                original_ref=original_ref,
+                order=order,
+            )
+        )
+
+    if not refs and request_inline_images:
+        for order, image in enumerate(sorted(request_inline_images, key=lambda item: item.order)):
+            if image.image_path in consumed_paths:
+                continue
+            inline_images.append(
+                InlineImage(
+                    placeholder=image.placeholder,
+                    image_path=image.image_path,
+                    original_ref=image.original_ref.strip(),
+                    order=order,
+                )
+            )
+    return inline_images
+
+
+def _filter_markdown_images(markdown: str, *, allowed_refs: set[str]) -> str:
+    if not allowed_refs:
+        return markdown
+    return MARKDOWN_IMAGE_RE.sub(
+        lambda match: match.group(0) if match.group(1).strip() in allowed_refs else "",
+        markdown,
+    )
 
 
 class XiaohongshuAdapter(BaseSourceAdapter):
@@ -155,11 +241,20 @@ class XiaohongshuAdapter(BaseSourceAdapter):
                 comments.append(f"- {content}")
         image_items = note.get("imageList") if isinstance(note.get("imageList"), list) else []
         image_lines = []
-        for image in image_items[:10]:
+        inline_images: list[InlineImage] = []
+        for index, image in enumerate(image_items[:10], start=1):
             if isinstance(image, dict):
                 url = str(image.get("urlDefault") or image.get("urlPre") or "").strip()
                 if url:
-                    image_lines.append(f"- {url}")
+                    image_lines.append(f"![图片{index}]({url})")
+                    inline_images.append(
+                        InlineImage(
+                            placeholder="",
+                            image_path="",
+                            original_ref=url,
+                            order=index - 1,
+                        )
+                    )
         parts = [f"# {title}", "", description]
         if author or published_at:
             parts.extend(
@@ -184,6 +279,7 @@ class XiaohongshuAdapter(BaseSourceAdapter):
             published_at=published_at,
             raw_markdown="\n".join(part for part in parts if part is not None).strip(),
             extra_summary=str(note.get("ipLocation") or data.get("ip_location") or "").strip(),
+            inline_images=inline_images,
             metadata={
                 "feed_id": feed_id,
                 "xsec_token": xsec_token,
@@ -328,15 +424,24 @@ class ProvidedContentAdapter(BaseSourceAdapter):
         content = request.provided_content.strip()
         if is_invalid_extracted_content(content):
             raise DepositSourceError("上游提供的正文内容疑似异常页或壳页，已拒绝沉淀。")
+        allowed_refs = {image.original_ref.strip() for image in request.inline_images if image.original_ref.strip()}
+        if allowed_refs:
+            content = _filter_markdown_images(content, allowed_refs=allowed_refs)
         source_url = request.urls[0] if request.urls else ""
-        fallback_title = source_url or "已提供正文内容"
-        title = extract_title_from_markdown(content, fallback=fallback_title)
+        fallback_title = request.source_title.strip() or source_url or "已提供正文内容"
+        title = request.source_title.strip() or extract_title_from_markdown(content, fallback=fallback_title)
         source_type = "url" if source_url else "text"
+        inline_images = _build_inline_images(
+            content,
+            request_inline_images=request.inline_images,
+            fallback_original_refs=[],
+        )
         return SourceMaterial(
             source_type=source_type,
             source_uri=source_url,
             title=title,
             raw_markdown=content,
+            inline_images=inline_images,
             metadata={
                 "source_url": source_url,
                 "content_origin": "provided_content",
@@ -361,7 +466,15 @@ class GenericUrlAdapter(BaseSourceAdapter):
         content = parsed.markdown_content.strip()
         if not content or is_invalid_extracted_content(content):
             raise DepositSourceError(f"链接解析失败：{url}")
+        allowed_refs = {image.original_ref.strip() for image in request.inline_images if image.original_ref.strip()}
+        if allowed_refs:
+            content = _filter_markdown_images(content, allowed_refs=allowed_refs)
         title = str(parsed.metadata.get("title") or "").strip() or extract_title_from_markdown(content, fallback=url)
+        inline_images = _build_inline_images(
+            content,
+            request_inline_images=request.inline_images,
+            fallback_original_refs=[ref.original_ref.strip() for ref in parsed.image_refs],
+        )
         return SourceMaterial(
             source_type="url",
             source_uri=url,
@@ -369,6 +482,7 @@ class GenericUrlAdapter(BaseSourceAdapter):
             author=str(parsed.metadata.get("author") or "").strip(),
             published_at=str(parsed.metadata.get("published_at") or "").strip(),
             raw_markdown=content,
+            inline_images=inline_images,
             metadata={
                 **dict(parsed.metadata),
                 "source_url": url,
