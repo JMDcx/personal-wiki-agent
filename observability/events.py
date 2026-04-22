@@ -35,6 +35,8 @@ _DEFAULT_DEBUG_EVENTS = {
     "generation_failed",
     "deposit_started",
     "deposit_completed",
+    "deposit_feishu_markdown_prepared",
+    "deposit_ingest_markdown_prepared",
     "feishu_write_started",
     "feishu_write_completed",
     "reply_sent",

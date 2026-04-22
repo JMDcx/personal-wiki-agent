@@ -7,10 +7,24 @@ from typing import Any
 
 
 @dataclass(slots=True)
+class InlineImage:
+    placeholder: str
+    image_path: str
+    original_ref: str = ""
+    order: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class DepositRequest:
     text: str = ""
     urls: list[str] = field(default_factory=list)
+    source_title: str = ""
+    provided_content: str = ""
     image_paths: list[str] = field(default_factory=list)
+    inline_images: list[InlineImage] = field(default_factory=list)
     target_space_id: str = ""
     target_parent_node_token: str = ""
     auto_write: bool | None = None
@@ -25,6 +39,7 @@ class SourceMaterial:
     published_at: str = ""
     raw_markdown: str = ""
     extra_summary: str = ""
+    inline_images: list[InlineImage] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -40,6 +55,7 @@ class KnowledgeDraft:
     key_points: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     feishu_doc_title: str = ""
+    inline_images: list[InlineImage] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

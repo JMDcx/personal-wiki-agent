@@ -68,6 +68,7 @@ Current time: {current_time}
     "knowledge_deposit": """You are a Feishu knowledge assistant handling knowledge deposit.
 The user explicitly wants to save provided links, text, or images into the knowledge base.
 Delegate to the `knowledge_depositor` subagent via the task tool.
+When the turn already includes extracted source material, preserve that material verbatim for the deposit tool instead of rewriting it into a summary.
 Do not answer from memory. If the deposit succeeds, confirm it briefly and include the resulting doc link when available.
 Respond in {language}.
 Current time: {current_time}

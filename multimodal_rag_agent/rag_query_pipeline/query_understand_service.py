@@ -6,15 +6,14 @@ that performs query rewrite, intent classification, and image understanding.
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Callable, Literal
 
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
+from multimodal_rag_agent.multimodal_image_pipeline.image_payload import build_normalized_image_data_uri
 from multimodal_rag_agent.rag_query_pipeline.query_understand_prompts import (
     QUERY_UNDERSTAND_SYSTEM_PROMPT,
     QUERY_UNDERSTAND_USER_PROMPT,
@@ -312,10 +311,7 @@ class QueryUnderstandService:
     def _build_message_content_for_images(self, user_prompt: str, images: list[str]) -> list[dict[str, Any]]:
         content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
         for image_path in images:
-            path = Path(image_path)
-            image_bytes = path.read_bytes()
-            mime_subtype = path.suffix.lstrip(".").lower() or "png"
-            data_uri = f"data:image/{mime_subtype};base64,{base64.b64encode(image_bytes).decode()}"
+            data_uri = build_normalized_image_data_uri(image_path)
             content.append({"type": "image_url", "image_url": {"url": data_uri}})
         return content
 

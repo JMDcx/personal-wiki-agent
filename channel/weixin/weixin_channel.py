@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+import requests
 from dotenv import load_dotenv
+from PIL import Image
 
 try:
     from feishu_wiki_rag_agent.agent import invoke_agent
@@ -34,6 +36,7 @@ except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from observability.events import log_event, log_exception, preview_text
     from observability.logging import configure_logging
 from multimodal_rag_agent.docreader_service.client import DocreaderService
+from multimodal_rag_agent.deposit_pipeline.models import InlineImage
 from multimodal_rag_agent.docreader_service.schemas import ParseRequest
 from multimodal_rag_agent.models import ImageRef, ParsedDocument
 
@@ -74,7 +77,7 @@ class WeixinChannel:
         settings: Settings | None = None,
         *,
         api: WeixinApi | None = None,
-        agent_runner: Callable[[str, str, list[str]], str] | None = None,
+        agent_runner: Callable[[str, str, list[str], dict[str, object] | None], str] | None = None,
         deduper: MessageDeduper | None = None,
         docreader: DocreaderService | None = None,
         media_downloader: Callable[..., str] | None = None,
@@ -82,11 +85,12 @@ class WeixinChannel:
         self.settings = settings or get_settings()
         self.api = api
         self.agent_runner = agent_runner or (
-            lambda question, thread_id, images: invoke_agent(
+            lambda question, thread_id, images, message_context=None: invoke_agent(
                 question,
                 settings=self.settings,
                 thread_id=thread_id,
                 images=images,
+                message_context=message_context,
             )
         )
         self.deduper = deduper or MessageDeduper()
@@ -140,7 +144,7 @@ class WeixinChannel:
             )
 
             try:
-                prompt, images = self._build_agent_turn(message)
+                prompt, images, inline_images, source_title = self._build_agent_turn(message)
             except UserFacingAttachmentError as exc:
                 log_exception("attachment_adaptation_failed", exc, stage="weixin_build_agent_turn")
                 self._reply_text(from_user_id, context_token, str(exc))
@@ -154,7 +158,22 @@ class WeixinChannel:
                 prompt_preview=preview_text(prompt),
             )
             try:
-                answer = self.agent_runner(prompt, thread_id, images)
+                answer = self.agent_runner(
+                    prompt,
+                    thread_id,
+                    images,
+                    {
+                        "chat_type": "direct",
+                        "raw_text": message.text,
+                        "normalized_text": message.stripped_text_without_urls() or message.text,
+                        "inline_images_json": json.dumps(
+                            [image.to_dict() for image in inline_images],
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        "source_title": source_title,
+                    },
+                )
                 self._reply_text(from_user_id, context_token, answer)
                 log_event(
                     "reply_sent",
@@ -282,9 +301,11 @@ class WeixinChannel:
                 if failures >= MAX_CONSECUTIVE_FAILURES:
                     failures = 0
 
-    def _build_agent_turn(self, message: WeixinMessage) -> tuple[str, list[str]]:
+    def _build_agent_turn(self, message: WeixinMessage) -> tuple[str, list[str], list[InlineImage], str]:
         images = list(message.image_paths)
+        inline_images: list[InlineImage] = []
         text_without_urls = message.stripped_text_without_urls()
+        source_title = ""
 
         link_contexts: list[tuple[str, str]] = []
         file_contexts: list[tuple[str, str]] = []
@@ -292,14 +313,18 @@ class WeixinChannel:
         for url in message.urls:
             parsed = self._parse_url(url)
             link_contexts.append((url, parsed.markdown_content.strip()))
-            images.extend(self._persist_image_refs(message.message_id, "link", url, parsed.image_refs))
+            if not source_title:
+                source_title = str(parsed.metadata.get("title", "")).strip()
+            persisted = self._persist_inline_images(message.message_id, "link", url, parsed.image_refs)
+            inline_images.extend(persisted)
+            images.extend(image.image_path for image in persisted if image.image_path)
 
         for attachment in message.file_attachments:
             parsed = self._parse_file(attachment)
             file_contexts.append((attachment.display_name, parsed.markdown_content.strip()))
-            images.extend(
-                self._persist_image_refs(message.message_id, "file", attachment.display_name, parsed.image_refs)
-            )
+            persisted = self._persist_inline_images(message.message_id, "file", attachment.display_name, parsed.image_refs)
+            inline_images.extend(persisted)
+            images.extend(image.image_path for image in persisted if image.image_path)
 
         if link_contexts or file_contexts:
             effective_question = text_without_urls or self._default_attachment_question(
@@ -311,12 +336,12 @@ class WeixinChannel:
                 user_question=effective_question,
                 link_contexts=link_contexts,
                 file_contexts=file_contexts,
-            ), images
+            ), images, inline_images, source_title
 
         if images and not text_without_urls:
-            return "请分析这张图片的内容，并尽量直接回答用户最可能想问的问题。", images
+            return "请分析这张图片的内容，并尽量直接回答用户最可能想问的问题。", images, inline_images, source_title
         if text_without_urls:
-            return text_without_urls, images
+            return text_without_urls, images, inline_images, source_title
 
         raise UserFacingAttachmentError("未识别到可处理的文本、链接、图片或文件内容。")
 
@@ -352,14 +377,38 @@ class WeixinChannel:
         source_label: str,
         image_refs: list[ImageRef],
     ) -> list[str]:
-        saved_paths: list[str] = []
+        return [
+            image.image_path
+            for image in self._persist_inline_images(message_id, source_kind, source_label, image_refs)
+            if image.image_path
+        ]
+
+    def _persist_inline_images(
+        self,
+        message_id: str,
+        source_kind: str,
+        source_label: str,
+        image_refs: list[ImageRef],
+    ) -> list[InlineImage]:
+        persisted_images: list[InlineImage] = []
         for index, image_ref in enumerate(image_refs):
-            if not image_ref.image_data:
+            image_data = image_ref.image_data or self._download_remote_image_ref(image_ref)
+            if not image_data:
                 continue
             suffix = Path(image_ref.filename).suffix or ".png"
             file_name = f"{message_id}_{source_kind}_{index}{suffix}"
             save_path = self.settings.weixin_tmp_dir / file_name
-            save_path.write_bytes(image_ref.image_data)
+            save_path.write_bytes(image_data)
+            if self._should_filter_noise_image(save_path, image_ref):
+                log_event(
+                    "attachment_image_filtered",
+                    channel="weixin",
+                    source_kind=source_kind,
+                    source_label=source_label,
+                    save_path=str(save_path),
+                    original_ref=image_ref.original_ref,
+                )
+                continue
             log_event(
                 "attachment_image_saved",
                 level=logging.DEBUG,
@@ -368,8 +417,85 @@ class WeixinChannel:
                 source_label=source_label,
                 save_path=str(save_path),
             )
-            saved_paths.append(str(save_path))
-        return saved_paths
+            persisted_images.append(
+                InlineImage(
+                    placeholder="",
+                    image_path=str(save_path),
+                    original_ref=image_ref.original_ref.strip(),
+                    order=len(persisted_images),
+                )
+            )
+        return persisted_images
+
+    def _should_filter_noise_image(self, image_path: Path, image_ref: ImageRef) -> bool:
+        suffix = image_path.suffix.lower()
+        original_ref = image_ref.original_ref.lower()
+        filename = image_path.name.lower()
+        if suffix == ".gif":
+            return True
+        if "logo" in original_ref or "logo" in filename:
+            return True
+        try:
+            with Image.open(image_path) as image:
+                width, height = image.size
+                if width <= 80 or height <= 80:
+                    return True
+                if width == height and max(width, height) <= 600:
+                    grayscale = image.convert("L")
+                    colors = grayscale.getcolors(maxcolors=32)
+                    if colors and len(colors) <= 8:
+                        return True
+                    if self._looks_like_qr(grayscale):
+                        return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _looks_like_qr(image: Image.Image) -> bool:
+        width, height = image.size
+        if abs(width - height) > 8 or width < 120 or height < 120:
+            return False
+        sample = image.resize((32, 32))
+        colors = sample.getcolors(maxcolors=8)
+        if not colors:
+            return False
+        dark_pixels = 0
+        total_pixels = 32 * 32
+        for count, value in colors:
+            if value < 100:
+                dark_pixels += count
+        ratio = dark_pixels / total_pixels
+        return 0.2 <= ratio <= 0.8
+
+    def _download_remote_image_ref(self, image_ref: ImageRef) -> bytes:
+        original_ref = image_ref.original_ref.strip()
+        if not original_ref.startswith(("http://", "https://")):
+            return b""
+        try:
+            response = requests.get(original_ref, timeout=self.settings.weixin_request_timeout)
+            response.raise_for_status()
+        except Exception:
+            log_exception(
+                "attachment_image_download_failed",
+                RuntimeError(f"Failed to download image ref: {preview_text(original_ref)}"),
+                channel="weixin",
+                source_kind="link",
+                source_label=preview_text(original_ref),
+            )
+            return b""
+        content_type = response.headers.get("Content-Type", "")
+        if content_type.startswith("image/") and not Path(image_ref.filename).suffix:
+            suffix = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/gif": ".gif",
+                "image/webp": ".webp",
+                "image/bmp": ".bmp",
+            }.get(content_type.lower(), "")
+            if suffix:
+                image_ref.filename = f"{image_ref.filename}{suffix}" if image_ref.filename else f"image{suffix}"
+        return response.content
 
     @staticmethod
     def _default_attachment_question(*, has_links: bool, has_files: bool) -> str:

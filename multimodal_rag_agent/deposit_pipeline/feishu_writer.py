@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -30,12 +31,16 @@ except ModuleNotFoundError:  # pragma: no cover - source tree fallback
         def log_exception(event: str, exc: BaseException, **_: Any) -> None:
             return None
 
+from multimodal_rag_agent.deposit_pipeline.models import InlineImage
+
 
 @dataclass(slots=True)
 class FeishuWriteResult:
     document_token: str
     document_url: str
     wiki_node_token: str = ""
+    inline_rendered_count: int = 0
+    fallback_appended_count: int = 0
     raw_payload: dict[str, Any] | None = None
 
 
@@ -78,11 +83,18 @@ class FeishuDepositWriter:
         *,
         title: str,
         markdown_content: str,
+        image_paths: list[str] | None = None,
+        inline_images: list[InlineImage] | None = None,
         target_space_id: str,
         target_parent_node_token: str,
     ) -> FeishuWriteResult:
         started_at = perf_counter()
         backend = (self.settings.feishu_deposit_write_backend or "lark_cli").strip().lower()
+        prepared_markdown, unresolved_inline_images = self._prepare_markdown_for_feishu(
+            markdown_content,
+            inline_images=inline_images or [],
+        )
+        inline_rendered_count = len((inline_images or [])) - len(unresolved_inline_images)
         log_event(
             "feishu_write_started",
             title=title,
@@ -94,19 +106,26 @@ class FeishuDepositWriter:
             if backend == "lark_cli":
                 result = self._write_markdown_via_lark_cli(
                     title=title,
-                    markdown_content=markdown_content,
+                    markdown_content=prepared_markdown,
                     target_space_id=target_space_id,
                     target_parent_node_token=target_parent_node_token,
                 )
             elif backend == "openapi":
                 result = self._write_markdown_via_openapi(
                     title=title,
-                    markdown_content=markdown_content,
+                    markdown_content=prepared_markdown,
                     target_space_id=target_space_id,
                     target_parent_node_token=target_parent_node_token,
                 )
             else:
                 raise RuntimeError(f"Unsupported FEISHU_DEPOSIT_WRITE_BACKEND: {backend}")
+            inserted_image_count = self._insert_images_if_needed(
+                document_ref=result.document_token or result.document_url,
+                image_paths=self._fallback_image_paths(
+                    image_paths=image_paths or [],
+                    unresolved_inline_images=unresolved_inline_images,
+                ),
+            )
 
             elapsed_ms = (perf_counter() - started_at) * 1000
             log_event(
@@ -115,8 +134,13 @@ class FeishuDepositWriter:
                 backend=backend,
                 document_token=result.document_token,
                 has_wiki_node=bool(result.wiki_node_token),
+                inline_rendered_count=inline_rendered_count,
+                fallback_appended_count=inserted_image_count,
+                inserted_image_count=inserted_image_count,
                 duration_ms=round(elapsed_ms, 1),
             )
+            result.inline_rendered_count = inline_rendered_count
+            result.fallback_appended_count = inserted_image_count
             return result
         except Exception as exc:  # noqa: BLE001
             elapsed_ms = (perf_counter() - started_at) * 1000
@@ -128,6 +152,38 @@ class FeishuDepositWriter:
                 duration_ms=round(elapsed_ms, 1),
             )
             raise
+
+    def _prepare_markdown_for_feishu(
+        self,
+        markdown_content: str,
+        *,
+        inline_images: list[InlineImage],
+    ) -> tuple[str, list[InlineImage]]:
+        rendered = markdown_content
+        unresolved: list[InlineImage] = []
+        for image in inline_images:
+            replacement = self._feishu_markdown_image(image.original_ref)
+            if replacement:
+                rendered = rendered.replace(image.placeholder, replacement)
+            else:
+                unresolved.append(image)
+        return rendered, unresolved
+
+    @staticmethod
+    def _feishu_markdown_image(original_ref: str) -> str:
+        candidate = str(original_ref or "").strip()
+        if candidate.startswith(("http://", "https://")):
+            return f"![]({candidate})"
+        return ""
+
+    @staticmethod
+    def _fallback_image_paths(*, image_paths: list[str], unresolved_inline_images: list[InlineImage]) -> list[str]:
+        if not unresolved_inline_images:
+            return []
+        unresolved_paths = [image.image_path.strip() for image in unresolved_inline_images if image.image_path.strip()]
+        if unresolved_paths:
+            return list(dict.fromkeys(unresolved_paths))
+        return [path for path in image_paths if str(path).strip()]
 
     def _write_markdown_via_lark_cli(
         self,
@@ -181,6 +237,21 @@ class FeishuDepositWriter:
         data = payload.get("data") or {}
         document_token = str(data.get("doc_id") or data.get("document_id") or "").strip()
         document_url = str(data.get("doc_url") or data.get("url") or "").strip()
+        if not document_token and str(data.get("status", "")).strip().lower() == "running":
+            task_id = str(data.get("task_id", "")).strip()
+            if task_id:
+                polled_token, polled_url, poll_payload = self._poll_lark_cli_create_task(
+                    title=sanitized_title,
+                    target_space_id=target_space_id,
+                    target_parent_node_token=target_parent_node_token,
+                )
+                if polled_token or polled_url:
+                    document_token = polled_token or document_token
+                    document_url = polled_url or document_url
+                    payload = {
+                        **payload,
+                        "task_poll": poll_payload,
+                    }
         wiki_node_token = self._extract_token_from_url(document_url)
         if not document_token:
             raise RuntimeError(f"lark-cli docs +create succeeded but doc_id is missing: {stdout}")
@@ -188,8 +259,68 @@ class FeishuDepositWriter:
             document_token=document_token,
             document_url=document_url,
             wiki_node_token=wiki_node_token,
+            inline_rendered_count=0,
+            fallback_appended_count=0,
             raw_payload=payload,
         )
+
+    def _poll_lark_cli_create_task(
+        self,
+        *,
+        title: str,
+        target_space_id: str,
+        target_parent_node_token: str,
+        max_attempts: int = 20,
+        poll_interval: float = 1.0,
+    ) -> tuple[str, str, dict[str, Any]]:
+        last_payload: dict[str, Any] = {"strategy": "wiki_lookup"}
+        for _ in range(max_attempts):
+            lookup_token, lookup_url = self._find_created_doc_in_wiki(
+                title=title,
+                target_space_id=target_space_id,
+                target_parent_node_token=target_parent_node_token,
+            )
+            if lookup_token or lookup_url:
+                last_payload = {
+                    "strategy": "wiki_lookup",
+                    "document_token": lookup_token,
+                    "document_url": lookup_url,
+                }
+                return lookup_token, lookup_url, last_payload
+            time.sleep(poll_interval)
+        raise RuntimeError(f"lark-cli create_doc task timed out: {json.dumps(last_payload, ensure_ascii=False)}")
+
+    def _find_created_doc_in_wiki(
+        self,
+        *,
+        title: str,
+        target_space_id: str,
+        target_parent_node_token: str,
+    ) -> tuple[str, str]:
+        if not target_space_id or not target_parent_node_token:
+            return "", ""
+        try:
+            children = self.feishu_client.list_wiki_children(target_space_id, target_parent_node_token)
+        except Exception:
+            return "", ""
+        normalized_title = self._sanitize_title(title)
+        for child in children:
+            child_title = str(child.get("title", "")).strip()
+            if child_title != normalized_title:
+                continue
+            document_url = str(child.get("url") or "").strip()
+            document_token = str(
+                child.get("obj_token")
+                or child.get("doc_id")
+                or child.get("document_id")
+                or child.get("token")
+                or ""
+            ).strip()
+            if not document_token and document_url:
+                document_token = self._extract_token_from_url(document_url)
+            if document_token or document_url:
+                return document_token, document_url
+        return "", ""
 
     def _write_markdown_via_openapi(
         self,
@@ -301,6 +432,8 @@ class FeishuDepositWriter:
                 return FeishuWriteResult(
                     document_token=document_token,
                     document_url=document_url,
+                    inline_rendered_count=0,
+                    fallback_appended_count=0,
                     raw_payload=payload,
                 )
             if job_status == 2:
@@ -336,8 +469,57 @@ class FeishuDepositWriter:
             document_token=document_token,
             document_url=f"{self.settings.feishu_api_base.replace('open.', '')}/docx/{document_token}",
             wiki_node_token=wiki_token,
+            inline_rendered_count=0,
+            fallback_appended_count=0,
             raw_payload=payload,
         )
+
+    def _insert_images_if_needed(self, *, document_ref: str, image_paths: list[str]) -> int:
+        valid_paths = [path for path in image_paths if Path(path).exists() and Path(path).is_file()]
+        if not valid_paths or not document_ref:
+            return 0
+        if not shutil.which("lark-cli"):
+            log_event(
+                "feishu_image_insert_skipped",
+                reason="lark_cli_unavailable",
+                document_ref=document_ref,
+                image_count=len(valid_paths),
+            )
+            return 0
+
+        profile = self.settings.feishu_lark_cli_profile.strip() or "feishu-wiki-rag-agent"
+        inserted = 0
+        for image_path in valid_paths:
+            path = Path(image_path)
+            command = [
+                "lark-cli",
+                "docs",
+                "+media-insert",
+                "--profile",
+                profile,
+                "--as",
+                "bot",
+                "--doc",
+                document_ref,
+                "--file",
+                str(path),
+                "--type",
+                "image",
+                "--caption",
+                path.name,
+            ]
+            result = self.cli_runner(command, capture_output=True, text=True, timeout=self.request_timeout)
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+                raise RuntimeError(f"lark-cli docs +media-insert failed: {detail}")
+            inserted += 1
+            log_event(
+                "feishu_image_inserted",
+                document_ref=document_ref,
+                image_path=str(path),
+                caption=path.name,
+            )
+        return inserted
 
     def _poll_wiki_task(self, task_id: str, *, max_attempts: int = 15, poll_interval: float = 1.0) -> str:
         last_payload: dict[str, Any] | None = None
