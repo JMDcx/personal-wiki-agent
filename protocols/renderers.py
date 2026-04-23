@@ -58,6 +58,30 @@ def render_reply_context_line(reply_context: dict[str, object] | None) -> str:
     return f"Reply target: {target}" if target else ""
 
 
+def _compact_context_text(text: object, limit: int = 160) -> str:
+    stripped = str(text or "").strip()
+    if len(stripped) <= limit:
+        return stripped
+    return f"{stripped[: max(0, limit - 3)].rstrip()}..."
+
+
+def render_group_recent_turn_lines(raw_turns: object) -> list[str]:
+    """Render recent group turns as compact context lines."""
+    if not isinstance(raw_turns, list):
+        return []
+    lines: list[str] = []
+    for raw_turn in raw_turns:
+        if not isinstance(raw_turn, dict):
+            continue
+        question = _compact_context_text(raw_turn.get("question"))
+        answer = _compact_context_text(raw_turn.get("answer"))
+        if not question or not answer:
+            continue
+        sender_open_id = str(raw_turn.get("sender_open_id", "")).strip() or "unknown"
+        lines.append(f"- sender: {sender_open_id}; user: {question}; assistant: {answer}")
+    return lines
+
+
 def render_message_context_lines(message_context: MessageContext | dict[str, object] | None) -> list[str]:
     """Render message context as stable controller prompt lines."""
     if message_context is None:
@@ -84,6 +108,13 @@ def render_message_context_lines(message_context: MessageContext | dict[str, obj
     source_title = str(raw_payload.get("source_title", "")).strip()
     if source_title:
         lines.append(f"source_title: {source_title}")
+    group_thread_id = str(raw_payload.get("group_thread_id", "")).strip()
+    if group_thread_id:
+        lines.append(f"group_thread_id: {group_thread_id}")
+    group_recent_turn_lines = render_group_recent_turn_lines(raw_payload.get("group_recent_turns"))
+    if group_recent_turn_lines:
+        lines.append("group_recent_turns:")
+        lines.extend(group_recent_turn_lines)
     if context.reply_context is not None:
         reply_context = context.reply_context.to_dict()
         lines.append("reply_context:")

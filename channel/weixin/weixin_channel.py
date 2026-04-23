@@ -5,9 +5,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Callable
 
 import requests
@@ -16,6 +18,7 @@ from PIL import Image
 
 try:
     from feishu_wiki_rag_agent.agent import invoke_agent
+    from feishu_wiki_rag_agent.channel.dispatcher import ConcurrentMessageDispatcher, DispatchContext
     from feishu_wiki_rag_agent.channel.weixin.weixin_api import (
         CDN_BASE_URL,
         DEFAULT_BASE_URL,
@@ -24,16 +27,21 @@ try:
     from feishu_wiki_rag_agent.channel.weixin.weixin_api import download_media_from_cdn
     from feishu_wiki_rag_agent.channel.weixin.weixin_message import DownloadedAttachment, WeixinMessage
     from feishu_wiki_rag_agent.config import Settings, get_settings
-    from feishu_wiki_rag_agent.observability.context import bind_log_context
-    from feishu_wiki_rag_agent.observability.events import log_event, log_exception, preview_text
+    from feishu_wiki_rag_agent.observability.context import (
+        bind_log_context,
+        bind_request_context,
+        record_request_timing,
+    )
+    from feishu_wiki_rag_agent.observability.events import emit_request_summary, log_event, log_exception, preview_text
     from feishu_wiki_rag_agent.observability.logging import configure_logging
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from agent import invoke_agent
+    from channel.dispatcher import ConcurrentMessageDispatcher, DispatchContext
     from channel.weixin.weixin_api import CDN_BASE_URL, DEFAULT_BASE_URL, WeixinApi, download_media_from_cdn
     from channel.weixin.weixin_message import DownloadedAttachment, WeixinMessage
     from config import Settings, get_settings
-    from observability.context import bind_log_context
-    from observability.events import log_event, log_exception, preview_text
+    from observability.context import bind_log_context, bind_request_context, record_request_timing
+    from observability.events import emit_request_summary, log_event, log_exception, preview_text
     from observability.logging import configure_logging
 from multimodal_rag_agent.docreader_service.client import DocreaderService
 from multimodal_rag_agent.deposit_pipeline.models import InlineImage
@@ -47,6 +55,8 @@ TEXT_CHUNK_LIMIT = 4000
 MAX_CONSECUTIVE_FAILURES = 3
 RETRY_DELAY = 2
 BACKOFF_DELAY = 30
+BUSY_REPLY_TEXT = "当前排队较多，请稍后再试"
+THINKING_REPLY_TEXT = "thinking..."
 
 
 @dataclass
@@ -55,14 +65,16 @@ class MessageDeduper:
 
     ttl_seconds: int = 60 * 60
     _seen: dict[str, float] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def should_process(self, message_id: str, now: float | None = None) -> bool:
         current = now if now is not None else time.time()
-        self._seen = {key: ts for key, ts in self._seen.items() if current - ts < self.ttl_seconds}
-        if message_id in self._seen:
-            return False
-        self._seen[message_id] = current
-        return True
+        with self._lock:
+            self._seen = {key: ts for key, ts in self._seen.items() if current - ts < self.ttl_seconds}
+            if message_id in self._seen:
+                return False
+            self._seen[message_id] = current
+            return True
 
 
 class UserFacingAttachmentError(RuntimeError):
@@ -81,6 +93,7 @@ class WeixinChannel:
         deduper: MessageDeduper | None = None,
         docreader: DocreaderService | None = None,
         media_downloader: Callable[..., str] | None = None,
+        dispatcher: ConcurrentMessageDispatcher | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.api = api
@@ -94,10 +107,37 @@ class WeixinChannel:
             )
         )
         self.deduper = deduper or MessageDeduper()
-        self.docreader = docreader or DocreaderService()
+        self._provided_docreader = docreader
+        self._docreader_local = threading.local()
         self.media_downloader = media_downloader or download_media_from_cdn
+        self.dispatcher = dispatcher or self._build_dispatcher()
         self._cursor = ""
         self._context_tokens: dict[str, str] = {}
+        self._context_tokens_lock = threading.Lock()
+
+    def _build_dispatcher(self) -> ConcurrentMessageDispatcher | None:
+        if not self.settings.bot_concurrency_enabled:
+            return None
+        return ConcurrentMessageDispatcher(
+            max_workers=self.settings.bot_concurrency_workers,
+            queue_size=self.settings.bot_concurrency_queue_size,
+            per_thread_serial=self.settings.bot_concurrency_per_thread_serial,
+            thread_name_prefix="weixin-message-dispatcher",
+        )
+
+    def shutdown(self) -> None:
+        """Release channel-owned worker resources."""
+        if self.dispatcher is not None:
+            self.dispatcher.shutdown(wait=True)
+
+    def _get_docreader(self) -> DocreaderService:
+        if self._provided_docreader is not None:
+            return self._provided_docreader
+        service = getattr(self._docreader_local, "service", None)
+        if service is None:
+            service = DocreaderService()
+            self._docreader_local.service = service
+        return service
 
     def run(self) -> None:
         """Authenticate if needed and start the long-poll loop."""
@@ -106,8 +146,9 @@ class WeixinChannel:
         self._prime_cursor()
         self._poll_loop()
 
-    def handle_raw_message(self, raw_msg: dict) -> str | None:
+    def handle_raw_message(self, raw_msg: dict, *, dispatch_queue_ms: float | None = None) -> str | None:
         """Parse, adapt, answer, and reply to a single inbound Weixin message."""
+        worker_started_at = perf_counter()
         if str(raw_msg.get("message_type", "")) != "1":
             return None
 
@@ -118,18 +159,21 @@ class WeixinChannel:
         from_user_id = str(raw_msg.get("from_user_id", ""))
         context_token = str(raw_msg.get("context_token", ""))
         if from_user_id and context_token:
-            self._context_tokens[from_user_id] = context_token
+            with self._context_tokens_lock:
+                self._context_tokens[from_user_id] = context_token
 
         if self.api is None:
             self.api = self._build_api(token=self.settings.weixin_token)
         thread_id = f"weixin:{from_user_id}"
-        with bind_log_context(
+        with bind_request_context(
             request_id=f"weixin:{message_id}",
             thread_id=thread_id,
             channel="weixin",
             message_id=message_id,
             from_user_id=from_user_id,
         ):
+            if dispatch_queue_ms is not None:
+                record_request_timing("queue_ms", dispatch_queue_ms)
             log_event(
                 "message_received",
                 message_type=str(raw_msg.get("message_type", "")),
@@ -146,8 +190,10 @@ class WeixinChannel:
             try:
                 prompt, images, inline_images, source_title = self._build_agent_turn(message)
             except UserFacingAttachmentError as exc:
+                record_request_timing("worker_ms", (perf_counter() - worker_started_at) * 1000)
                 log_exception("attachment_adaptation_failed", exc, stage="weixin_build_agent_turn")
                 self._reply_text(from_user_id, context_token, str(exc))
+                emit_request_summary(status="error", level=logging.WARNING, stage="weixin_build_agent_turn")
                 return str(exc)
 
             log_event(
@@ -175,15 +221,77 @@ class WeixinChannel:
                     },
                 )
                 self._reply_text(from_user_id, context_token, answer)
+                record_request_timing("worker_ms", (perf_counter() - worker_started_at) * 1000)
                 log_event(
                     "reply_sent",
                     reply_channel="weixin",
                     answer_length=len(answer),
                     answer_preview=preview_text(answer),
                 )
+                emit_request_summary(status="ok")
                 return answer
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                record_request_timing("worker_ms", (perf_counter() - worker_started_at) * 1000)
+                log_exception(
+                    "request_failed",
+                    exc,
+                    stage="weixin_handle_raw_message",
+                    channel="weixin",
+                    message_id=message_id,
+                    from_user_id=from_user_id,
+                )
+                emit_request_summary(status="error", level=logging.ERROR, stage="weixin_handle_raw_message")
                 raise
+
+    def _dispatch_raw_message(self, raw_msg: dict) -> None:
+        """Submit one raw Weixin message to the worker pool when enabled."""
+        if str(raw_msg.get("message_type", "")) != "1":
+            return
+
+        message_id = str(raw_msg.get("message_id", raw_msg.get("seq", "")))
+        from_user_id = str(raw_msg.get("from_user_id", ""))
+        context_token = str(raw_msg.get("context_token", ""))
+        thread_id = f"weixin:{from_user_id}" if from_user_id else "weixin:unknown"
+        context_fields = {
+            "request_id": f"weixin:{message_id}" if message_id else "",
+            "thread_id": thread_id,
+            "channel": "weixin",
+            "message_id": message_id,
+            "from_user_id": from_user_id,
+        }
+
+        if not self.settings.bot_concurrency_enabled or self.dispatcher is None:
+            with bind_log_context(**context_fields):
+                self.handle_raw_message(raw_msg)
+            return
+
+        timing: dict[str, float] = {}
+        thinking_reply_ready = threading.Event()
+
+        def _on_started(context: DispatchContext) -> None:
+            timing["queue_ms"] = context.queue_ms
+
+        def _run_message() -> str | None:
+            thinking_reply_ready.wait()
+            with bind_log_context(**context_fields):
+                return self.handle_raw_message(raw_msg, dispatch_queue_ms=timing.get("queue_ms"))
+
+        result = self.dispatcher.submit(
+            thread_id,
+            _run_message,
+            on_started=_on_started,
+            on_rejected=lambda: self._reply_text(from_user_id, context_token, BUSY_REPLY_TEXT),
+            metadata={
+                "request_id": str(context_fields.get("request_id", "") or ""),
+                "channel": "weixin",
+                "message_id": message_id,
+                "from_user_id": from_user_id,
+                "transport": "long_poll",
+            },
+        )
+        if result.accepted:
+            self._reply_text(from_user_id, context_token, THINKING_REPLY_TEXT)
+        thinking_reply_ready.set()
 
     def _prime_cursor(self) -> None:
         """Drain the startup backlog to establish a cursor baseline before normal polling."""
@@ -274,7 +382,7 @@ class WeixinChannel:
                             message_id=message_id,
                             from_user_id=from_user_id,
                         ):
-                            self.handle_raw_message(raw_msg)
+                            self._dispatch_raw_message(raw_msg)
                     except Exception as exc:  # noqa: BLE001
                         log_exception(
                             "request_failed",
@@ -347,7 +455,7 @@ class WeixinChannel:
 
     def _parse_url(self, url: str) -> ParsedDocument:
         try:
-            parsed = self.docreader.parse(ParseRequest(url=url, title=url))
+            parsed = self._get_docreader().parse(ParseRequest(url=url, title=url))
         except Exception as exc:  # noqa: BLE001
             raise UserFacingAttachmentError(f"链接解析失败：{url}") from exc
         if not parsed.markdown_content.strip():
@@ -357,7 +465,7 @@ class WeixinChannel:
     def _parse_file(self, attachment: DownloadedAttachment) -> ParsedDocument:
         try:
             file_content = Path(attachment.path).read_bytes()
-            parsed = self.docreader.parse(
+            parsed = self._get_docreader().parse(
                 ParseRequest(
                     file_name=attachment.display_name,
                     file_type=Path(attachment.display_name).suffix.lstrip("."),
@@ -551,7 +659,8 @@ class WeixinChannel:
 
     def _reply_text(self, to_user_id: str, context_token: str, text: str) -> None:
         if not context_token and to_user_id:
-            context_token = self._context_tokens.get(to_user_id, "")
+            with self._context_tokens_lock:
+                context_token = self._context_tokens.get(to_user_id, "")
         if not to_user_id or not context_token:
             log_event(
                 "reply_skipped",

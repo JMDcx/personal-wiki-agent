@@ -39,7 +39,17 @@ _DEFAULT_DEBUG_EVENTS = {
     "deposit_ingest_markdown_prepared",
     "feishu_write_started",
     "feishu_write_completed",
+    "stream_started",
+    "stream_status_emitted",
+    "stream_delta_emitted",
+    "stream_update_sent",
+    "stream_completed",
+    "stream_failed",
+    "stream_fallback_used",
     "reply_sent",
+    "dispatch_submitted",
+    "dispatch_started",
+    "dispatch_completed",
 }
 _TOKEN_RE = re.compile(r"\b(sk-[A-Za-z0-9]{12,}|Bearer\s+[A-Za-z0-9._-]{12,}|cli_[A-Za-z0-9]{8,})\b")
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)

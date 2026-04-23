@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -25,9 +26,12 @@ if __package__ in {None, ""}:  # pragma: no cover - script execution fallback
         sys.path.insert(0, repo_root_str)
 
 try:
-    from feishu_wiki_rag_agent.agent import invoke_agent
+    from feishu_wiki_rag_agent.agent import invoke_agent, invoke_agent_stream
     from feishu_wiki_rag_agent.config import Settings, get_settings
+    from feishu_wiki_rag_agent.channel.dispatcher import ConcurrentMessageDispatcher, DispatchContext
     from feishu_wiki_rag_agent.channel.feishu.feishu_client import FeishuClient
+    from feishu_wiki_rag_agent.channel.feishu.group_memory import FeishuGroupMemoryStore
+    from feishu_wiki_rag_agent.channel.feishu.streaming import FeishuStreamingResponder, THINKING_REPLY_TEXT
     from feishu_wiki_rag_agent.multimodal_rag_agent.deposit_pipeline.adapters import extract_urls
     from feishu_wiki_rag_agent.multimodal_rag_agent.deposit_pipeline.models import InlineImage
     from feishu_wiki_rag_agent.multimodal_rag_agent.docreader_service.client import DocreaderService
@@ -48,9 +52,12 @@ try:
     from feishu_wiki_rag_agent.observability.logging import configure_logging
     from feishu_wiki_rag_agent.schemas import IncomingMessage, MentionRef, ReplyContext
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
-    from agent import invoke_agent
+    from agent import invoke_agent, invoke_agent_stream
     from config import Settings, get_settings
+    from channel.dispatcher import ConcurrentMessageDispatcher, DispatchContext
     from channel.feishu.feishu_client import FeishuClient
+    from channel.feishu.group_memory import FeishuGroupMemoryStore
+    from channel.feishu.streaming import FeishuStreamingResponder, THINKING_REPLY_TEXT
     from multimodal_rag_agent.deposit_pipeline.adapters import extract_urls
     from multimodal_rag_agent.deposit_pipeline.models import InlineImage
     from multimodal_rag_agent.docreader_service.client import DocreaderService
@@ -66,6 +73,7 @@ lark = None
 
 logging.getLogger("Lark").setLevel(logging.WARNING)
 MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
+BUSY_REPLY_TEXT = "当前排队较多，请稍后再试"
 
 
 @dataclass
@@ -144,15 +152,17 @@ class MessageDeduper:
 
     ttl_seconds: int = 60 * 60
     _seen: dict[str, float] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def should_process(self, message_id: str, now: float | None = None) -> bool:
         """Return whether the message should be processed."""
         current = now if now is not None else time.time()
-        self._seen = {key: ts for key, ts in self._seen.items() if current - ts < self.ttl_seconds}
-        if message_id in self._seen:
-            return False
-        self._seen[message_id] = current
-        return True
+        with self._lock:
+            self._seen = {key: ts for key, ts in self._seen.items() if current - ts < self.ttl_seconds}
+            if message_id in self._seen:
+                return False
+            self._seen[message_id] = current
+            return True
 
 
 class FeishuChannel:
@@ -164,8 +174,11 @@ class FeishuChannel:
         *,
         client: FeishuClient | None = None,
         agent_runner: Callable[[str, str, dict[str, object] | None], str] | None = None,
+        streaming_agent_runner: Callable[[str, str, dict[str, object] | None], object] | None = None,
         deduper: MessageDeduper | None = None,
         instance_guard: SingleInstanceGuard | None = None,
+        dispatcher: ConcurrentMessageDispatcher | None = None,
+        group_memory_store: FeishuGroupMemoryStore | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.client = client or FeishuClient(self.settings)
@@ -177,13 +190,77 @@ class FeishuChannel:
                 message_context=message_context,
             )
         )
-        self.docreader = DocreaderService()
+        self.streaming_agent_runner = streaming_agent_runner or (
+            lambda text, thread_id, message_context=None: invoke_agent_stream(
+                text,
+                settings=self.settings,
+                thread_id=thread_id,
+                message_context=message_context,
+            )
+        )
+        self._docreader_local = threading.local()
         self.deduper = deduper or MessageDeduper()
         self.instance_guard = instance_guard or SingleInstanceGuard(
             self.settings.rag_data_dir / "locks" / "feishu_channel.lock"
         )
+        self.dispatcher = dispatcher or self._build_dispatcher()
+        self.group_memory_store = group_memory_store or FeishuGroupMemoryStore(
+            self.settings.rag_data_dir / "group_memory" / "feishu",
+            max_recent_turns=self.settings.feishu_group_memory_recent_turns,
+        )
         self.bot_open_id: str | None = None
         self._startup_cutoff_ms: int = 0  # connection-start cutoff in epoch ms
+
+    def _build_dispatcher(self) -> ConcurrentMessageDispatcher | None:
+        if not self.settings.bot_concurrency_enabled:
+            return None
+        return ConcurrentMessageDispatcher(
+            max_workers=self.settings.bot_concurrency_workers,
+            queue_size=self.settings.bot_concurrency_queue_size,
+            per_thread_serial=self.settings.bot_concurrency_per_thread_serial,
+            thread_name_prefix="feishu-message-dispatcher",
+        )
+
+    def shutdown(self) -> None:
+        """Release channel-owned worker resources."""
+        if self.dispatcher is not None:
+            self.dispatcher.shutdown(wait=True)
+
+    def _get_docreader(self) -> DocreaderService:
+        service = getattr(self._docreader_local, "service", None)
+        if service is None:
+            service = DocreaderService()
+            self._docreader_local.service = service
+        return service
+
+    def _conversation_thread_id(self, incoming: IncomingMessage) -> str:
+        chat_id = incoming.chat_id or "unknown"
+        mode = str(self.settings.feishu_group_concurrency_mode or "member").strip().lower()
+        if mode not in {"chat", "member"}:
+            mode = "member"
+        if incoming.is_group and mode == "member":
+            sender_open_id = incoming.sender_open_id or "unknown_sender"
+            return f"feishu:{chat_id}:{sender_open_id}"
+        return f"feishu:{chat_id}"
+
+    def _recent_group_turns(self, incoming: IncomingMessage) -> list[dict[str, object]]:
+        if not incoming.is_group or self.settings.feishu_group_memory_recent_turns <= 0:
+            return []
+        return self.group_memory_store.recent_turns(
+            incoming.chat_id,
+            limit=self.settings.feishu_group_memory_recent_turns,
+        )
+
+    def _append_group_turn(self, incoming: IncomingMessage, answer: str) -> None:
+        if not incoming.is_group:
+            return
+        self.group_memory_store.append_turn(
+            chat_id=incoming.chat_id,
+            sender_open_id=incoming.sender_open_id,
+            message_id=incoming.message_id,
+            question=incoming.text,
+            answer=answer,
+        )
 
     def run(self) -> None:
         """Start the websocket client and listen for Feishu messages."""
@@ -263,13 +340,18 @@ class FeishuChannel:
         chat_id = str(message.get("chat_id", ""))
         thread_id = f"feishu:{chat_id}" if chat_id else ""
         request_id = f"feishu:{message_id}" if message_id else ""
-        with bind_log_context(
-            request_id=request_id,
-            thread_id=thread_id,
-            channel="feishu",
-            message_id=message_id,
-            chat_id=chat_id,
-        ):
+        context_fields = {
+            "request_id": request_id,
+            "thread_id": thread_id,
+            "channel": "feishu",
+            "message_id": message_id,
+            "chat_id": chat_id,
+        }
+        if self.settings.bot_concurrency_enabled and self.dispatcher is not None:
+            self._submit_event(event, context_fields)
+            return
+
+        with bind_log_context(**context_fields):
             try:
                 self.handle_event(event)
             except Exception as exc:  # noqa: BLE001
@@ -282,13 +364,132 @@ class FeishuChannel:
                     chat_id=chat_id,
                 )
 
-    def handle_event(self, event: dict) -> str | None:
+    def _submit_event(self, event: dict, context_fields: dict[str, object]) -> None:
+        incoming = self._parse_incoming_message(event)
+        if incoming is None:
+            return
+        thread_id = self._conversation_thread_id(incoming)
+        message_id = incoming.message_id
+        chat_id = incoming.chat_id
+        context_fields = {
+            "request_id": f"feishu:{message_id}" if message_id else "",
+            "thread_id": thread_id,
+            "channel": "feishu",
+            "message_id": message_id,
+            "chat_id": chat_id,
+        }
+        timing: dict[str, float] = {}
+        queued_reply: dict[str, str] = {}
+        queued_reply_ready = threading.Event()
+
+        def _on_started(context: DispatchContext) -> None:
+            timing["queue_ms"] = context.queue_ms
+
+        def _run_event() -> str | None:
+            queued_reply_ready.wait()
+            with bind_log_context(**context_fields):
+                try:
+                    return self._handle_incoming(
+                        incoming,
+                        dispatch_queue_ms=timing.get("queue_ms"),
+                        initial_reply_message_id=queued_reply.get("message_id", ""),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log_exception(
+                        "channel_dispatch_failed",
+                        exc,
+                        stage="feishu_websocket_dispatch",
+                        channel="feishu",
+                        message_id=message_id,
+                        chat_id=chat_id,
+                    )
+                    return None
+
+        result = self.dispatcher.submit(
+            thread_id,
+            _run_event,
+            on_started=_on_started,
+            on_rejected=lambda: self._reply_busy_for_incoming(incoming),
+            metadata={
+                "request_id": str(context_fields.get("request_id", "") or ""),
+                "channel": "feishu",
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "transport": "websocket",
+            },
+        )
+        if result.accepted:
+            queued_reply["message_id"] = self._reply_thinking_for_incoming(incoming)
+        queued_reply_ready.set()
+
+    def _reply_thinking_for_incoming(self, incoming: IncomingMessage) -> str:
+        try:
+            reply_message_id = self.client.reply_text(incoming.message_id, THINKING_REPLY_TEXT)
+            log_event(
+                "reply_sent",
+                reply_channel="feishu",
+                reason="dispatch_queued",
+                answer_length=len(THINKING_REPLY_TEXT),
+                answer_preview=THINKING_REPLY_TEXT,
+                reply_message_id=reply_message_id,
+            )
+            return reply_message_id
+        except Exception as exc:  # noqa: BLE001
+            log_exception(
+                "dispatch_queue_reply_failed",
+                exc,
+                stage="feishu_queue_reply",
+                channel="feishu",
+                message_id=incoming.message_id,
+            )
+            return ""
+
+    def _reply_busy_for_incoming(self, incoming: IncomingMessage) -> None:
+        try:
+            self.client.reply_text(incoming.message_id, BUSY_REPLY_TEXT)
+            log_event(
+                "reply_sent",
+                reply_channel="feishu",
+                reason="dispatch_rejected",
+                answer_length=len(BUSY_REPLY_TEXT),
+                answer_preview=BUSY_REPLY_TEXT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_exception(
+                "dispatch_rejection_reply_failed",
+                exc,
+                stage="feishu_busy_reply",
+                channel="feishu",
+                message_id=incoming.message_id,
+            )
+
+    def handle_event(
+        self,
+        event: dict,
+        *,
+        dispatch_queue_ms: float | None = None,
+        initial_reply_message_id: str = "",
+    ) -> str | None:
         """Parse and process a single Feishu event."""
         incoming = self._parse_incoming_message(event)
         if incoming is None:
             return None
+        return self._handle_incoming(
+            incoming,
+            dispatch_queue_ms=dispatch_queue_ms,
+            initial_reply_message_id=initial_reply_message_id,
+        )
 
-        thread_id = f"feishu:{incoming.chat_id}"
+    def _handle_incoming(
+        self,
+        incoming: IncomingMessage,
+        *,
+        dispatch_queue_ms: float | None = None,
+        initial_reply_message_id: str = "",
+    ) -> str | None:
+        """Process one already-normalized Feishu text message."""
+        worker_started_at = perf_counter()
+        thread_id = self._conversation_thread_id(incoming)
         request_id = f"feishu:{incoming.message_id}"
         with bind_request_context(
             request_id=request_id,
@@ -313,6 +514,8 @@ class FeishuChannel:
                 mentioned_users=incoming.mentioned_users,
                 question_preview=preview_text(incoming.text),
             )
+            if dispatch_queue_ms is not None:
+                record_request_timing("queue_ms", dispatch_queue_ms)
             log_event(
                 "message_normalized",
                 chat_type=incoming.chat_type,
@@ -330,12 +533,41 @@ class FeishuChannel:
                 text_preview=preview_text(incoming.text),
             )
             try:
-                agent_text, message_context = self._build_agent_turn(incoming)
-                answer = self.agent_runner(agent_text, thread_id, message_context)
+                group_recent_turns = self._recent_group_turns(incoming)
+                agent_text, message_context = self._build_agent_turn(
+                    incoming,
+                    group_recent_turns=group_recent_turns,
+                )
                 reply_started_at = perf_counter()
-                self.client.reply_text(incoming.message_id, answer)
+                if self.settings.feishu_streaming_enabled:
+                    responder = FeishuStreamingResponder(
+                        client=self.client,
+                        source_message_id=incoming.message_id,
+                        initial_reply_message_id=initial_reply_message_id,
+                        update_interval_seconds=self.settings.feishu_streaming_update_interval_ms / 1000,
+                        max_chars=self.settings.feishu_streaming_max_chars,
+                    )
+                    answer = responder.run(self.streaming_agent_runner(agent_text, thread_id, message_context))
+                else:
+                    answer = self.agent_runner(agent_text, thread_id, message_context)
+                    if initial_reply_message_id:
+                        try:
+                            self.client.update_text(initial_reply_message_id, answer)
+                        except Exception as exc:  # noqa: BLE001
+                            log_exception(
+                                "dispatch_queue_reply_update_failed",
+                                exc,
+                                stage="feishu_queue_reply_update",
+                                channel="feishu",
+                                message_id=incoming.message_id,
+                                reply_message_id=initial_reply_message_id,
+                            )
+                            self.client.reply_text(incoming.message_id, answer)
+                    else:
+                        self.client.reply_text(incoming.message_id, answer)
                 reply_elapsed_ms = (perf_counter() - reply_started_at) * 1000
                 record_request_timing("reply_ms", reply_elapsed_ms)
+                record_request_timing("worker_ms", (perf_counter() - worker_started_at) * 1000)
                 update_request_state(
                     reply_channel="feishu",
                     answer_length=len(answer),
@@ -348,9 +580,11 @@ class FeishuChannel:
                     answer_preview=preview_text(answer),
                     duration_ms=round(reply_elapsed_ms, 1),
                 )
+                self._append_group_turn(incoming, answer)
                 emit_request_summary(status="ok")
                 return answer
             except Exception as exc:  # noqa: BLE001
+                record_request_timing("worker_ms", (perf_counter() - worker_started_at) * 1000)
                 log_exception(
                     "request_failed",
                     exc,
@@ -363,8 +597,23 @@ class FeishuChannel:
                 emit_request_summary(status="error", level=logging.ERROR, stage="feishu_handle_event")
                 return None
 
-    def _build_agent_turn(self, incoming: IncomingMessage) -> tuple[str, dict[str, object]]:
+    def _build_agent_turn(
+        self,
+        incoming: IncomingMessage,
+        *,
+        group_recent_turns: list[dict[str, object]] | None = None,
+    ) -> tuple[str, dict[str, object]]:
         message_context = incoming.to_message_context()
+        if incoming.is_group:
+            message_context = {
+                **message_context,
+                "group_thread_id": f"feishu:{incoming.chat_id}",
+            }
+        if group_recent_turns:
+            message_context = {
+                **message_context,
+                "group_recent_turns": list(group_recent_turns),
+            }
         urls = extract_urls(incoming.text)
         if not urls:
             return incoming.text, message_context
@@ -392,7 +641,7 @@ class FeishuChannel:
         }
 
     def _parse_url(self, url: str) -> ParsedDocument:
-        parsed = self.docreader.parse(ParseRequest(url=url, title=url))
+        parsed = self._get_docreader().parse(ParseRequest(url=url, title=url))
         if not parsed.markdown_content.strip():
             raise RuntimeError(f"链接解析失败：{url}")
         return parsed

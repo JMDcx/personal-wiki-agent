@@ -42,6 +42,7 @@ packages = [
     "feishu_wiki_rag_agent.channel.feishu",
     "feishu_wiki_rag_agent.channel.weixin",
     "feishu_wiki_rag_agent.observability",
+    "feishu_wiki_rag_agent.protocols",
     "multimodal_rag_agent",
     "multimodal_rag_agent.api",
     "multimodal_rag_agent.docreader_service",
