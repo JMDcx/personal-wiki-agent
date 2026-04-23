@@ -138,6 +138,7 @@ _FEISHU_RUNTIME_THREAD_PREFIX = "feishu__"
 _HISTORY_USER_TEXT_LIMIT = 200
 _HISTORY_ASSISTANT_TEXT_LIMIT = 400
 _KNOWLEDGE_DEPOSIT_HISTORY_LIMIT = 5
+_COMBINED_HISTORY_LIMIT = 8
 
 
 def _question_preview(text: str, limit: int = 80) -> str:
@@ -572,6 +573,56 @@ def _load_history_from_runtime(agent: Any, thread_id: str, limit: int = 5) -> li
     return history[-limit:]
 
 
+def _group_memory_history_turns(message_context: dict[str, object] | MessageContext | None) -> list[HistoryTurn]:
+    if not isinstance(message_context, dict):
+        return []
+    raw_turns = message_context.get("group_recent_turns")
+    if not isinstance(raw_turns, list):
+        return []
+    history: list[HistoryTurn] = []
+    for raw_turn in raw_turns:
+        if not isinstance(raw_turn, dict):
+            continue
+        question = str(raw_turn.get("question", "")).strip()
+        answer = str(raw_turn.get("answer", "")).strip()
+        if not question or not answer:
+            continue
+        sender_open_id = str(raw_turn.get("sender_open_id", "")).strip() or "unknown"
+        history.append(
+            HistoryTurn(
+                user_question=f"[群成员 {sender_open_id}] {question}",
+                assistant_answer=answer,
+            )
+        )
+    return history
+
+
+def _group_thread_id_from_message_context(message_context: dict[str, object] | MessageContext | None) -> str:
+    if not isinstance(message_context, dict):
+        return ""
+    return str(message_context.get("group_thread_id", "")).strip()
+
+
+def _merge_history_turns(
+    group_history: list[HistoryTurn],
+    thread_history: list[HistoryTurn],
+    *,
+    limit: int = _COMBINED_HISTORY_LIMIT,
+) -> list[HistoryTurn]:
+    merged: list[HistoryTurn] = []
+    seen: set[tuple[str, str]] = set()
+    for turn in [*group_history, *thread_history]:
+        key = (turn.user_question, turn.assistant_answer)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(turn)
+    resolved_limit = max(0, int(limit))
+    if resolved_limit <= 0:
+        return []
+    return merged[-resolved_limit:]
+
+
 def list_thread_history(
     thread_id: str,
     *,
@@ -660,7 +711,13 @@ def _build_controller_context(
 ) -> ControllerInputContext:
     started_at = perf_counter()
     normalized_message_context = _normalize_message_context(message_context)
-    history = _load_history_from_runtime(agent_runtime, thread_id)
+    thread_history = _load_history_from_runtime(agent_runtime, thread_id)
+    legacy_group_thread_id = _group_thread_id_from_message_context(message_context)
+    legacy_group_history: list[HistoryTurn] = []
+    if legacy_group_thread_id and legacy_group_thread_id != thread_id:
+        legacy_group_history = _load_history_from_runtime(agent_runtime, legacy_group_thread_id)
+    group_history = _group_memory_history_turns(message_context)
+    history = _merge_history_turns([*legacy_group_history, *group_history], thread_history)
     understand_images = [] if _should_skip_images_for_query_understand(question, images) else images
     if images and not understand_images:
         log_event(
@@ -703,11 +760,18 @@ def _build_controller_context(
     )
     rendered_message_context: MessageContext | dict[str, object] = normalized_message_context
     if isinstance(message_context, dict):
-        inline_images_json = str(message_context.get("inline_images_json", "")).strip()
-        if inline_images_json:
+        extra_message_context: dict[str, object] = {}
+        for key in ("inline_images_json", "source_title", "group_thread_id"):
+            value = str(message_context.get(key, "")).strip()
+            if value:
+                extra_message_context[key] = value
+        group_recent_turns = message_context.get("group_recent_turns")
+        if isinstance(group_recent_turns, list) and group_recent_turns:
+            extra_message_context["group_recent_turns"] = group_recent_turns
+        if extra_message_context:
             rendered_message_context = {
                 **normalized_message_context.to_dict(),
-                "inline_images_json": inline_images_json,
+                **extra_message_context,
             }
     agent_images = [] if _should_skip_images_for_agent_invoke(understand_result.intent, question, images) else images
     if images and not agent_images:
@@ -750,6 +814,7 @@ def _build_controller_context(
         rewrite_query=controller_decision.rewrite_query,
         question_preview=_question_preview(question),
         history_turn_count=len(history),
+        group_history_turn_count=len(legacy_group_history) + len(group_history),
         image_count=len(agent_images),
         **_message_state_fields(normalized_message_context),
     )
@@ -761,6 +826,7 @@ def _build_controller_context(
         rewrite_query=controller_decision.rewrite_query,
         image_count=len(agent_images),
         history_turn_count=len(history),
+        group_history_turn_count=len(legacy_group_history) + len(group_history),
         duration_ms=round(elapsed_ms, 1),
         question_preview=_question_preview(question),
     )

@@ -150,15 +150,20 @@ class FeishuClient:
             created_message_id = str(data["message"].get("message_id") or "").strip()
         return created_message_id
 
-    def patch_text(self, message_id: str, text: str) -> None:
-        """Patch a bot-sent Feishu text message in place."""
+    def update_text(self, message_id: str, text: str) -> None:
+        """Edit a bot-sent Feishu text message in place."""
         self._request(
-            "PATCH",
+            "PUT",
             f"/open-apis/im/v1/messages/{message_id}",
             json_body={
                 "content": json.dumps({"text": text}, ensure_ascii=False),
+                "msg_type": "text",
             },
         )
+
+    def patch_text(self, message_id: str, text: str) -> None:
+        """Backward-compatible alias for editing a bot-sent text message."""
+        self.update_text(message_id, text)
 
     def get_message(self, message_id: str) -> dict[str, Any]:
         """Fetch a single Feishu message for reply-context reconstruction."""

@@ -15,10 +15,14 @@ except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from protocols.streaming import StreamEvent
 
 
+THINKING_REPLY_TEXT = "thinking..."
+_EMPTY_FINAL_TEXT = "当前索引中未找到相关内容。"
+
+
 class _FeishuStreamingClient(Protocol):
     def reply_text(self, message_id: str, text: str) -> str: ...
 
-    def patch_text(self, message_id: str, text: str) -> None: ...
+    def update_text(self, message_id: str, text: str) -> None: ...
 
 
 class FeishuStreamingResponder:
@@ -29,21 +33,28 @@ class FeishuStreamingResponder:
         *,
         client: _FeishuStreamingClient,
         source_message_id: str,
-        update_interval_seconds: float = 1.5,
+        initial_reply_message_id: str = "",
+        update_interval_seconds: float = 2.5,
         max_chars: int = 6000,
+        max_update_count: int = 25,
+        max_stream_seconds: float = 300.0,
         now_provider=time.monotonic,
     ) -> None:
         self.client = client
         self.source_message_id = source_message_id
+        self.reply_message_id = initial_reply_message_id.strip()
         self.update_interval_seconds = max(0.0, update_interval_seconds)
         self.max_chars = max(200, max_chars)
+        self.max_update_count = max(1, max_update_count)
+        self.max_stream_seconds = max(1.0, max_stream_seconds)
         self.now_provider = now_provider
-        self.reply_message_id = ""
-        self.placeholder_sent = False
-        self.patch_available = True
-        self.status_text = "正在处理..."
+        self.placeholder_sent = bool(self.reply_message_id)
+        self.update_available = True
+        self.status_text = THINKING_REPLY_TEXT
         self.answer_text = ""
+        self.stream_started_at = self.now_provider() if self.placeholder_sent else 0.0
         self.last_flush_at = 0.0
+        self.non_final_update_count = 0
 
     def run(self, events: Iterable[StreamEvent]) -> str:
         final_text = ""
@@ -73,7 +84,7 @@ class FeishuStreamingResponder:
                 self._flush(force=False)
                 continue
             if event.event_type == "final":
-                final_text = event.text
+                final_text = event.text.strip() or _EMPTY_FINAL_TEXT
                 self.answer_text = final_text
                 self.status_text = ""
                 self._flush(force=True, final=True)
@@ -94,10 +105,11 @@ class FeishuStreamingResponder:
     def _ensure_placeholder(self) -> None:
         if self.placeholder_sent:
             return
-        self.reply_message_id = self.client.reply_text(self.source_message_id, "正在处理...")
+        self.reply_message_id = self.client.reply_text(self.source_message_id, THINKING_REPLY_TEXT)
         self.placeholder_sent = True
+        self.stream_started_at = self.now_provider()
         if not self.reply_message_id:
-            self.patch_available = False
+            self.update_available = False
         log_event("stream_started", reply_message_id=self.reply_message_id)
 
     def _flush(self, *, force: bool, final: bool = False) -> None:
@@ -106,13 +118,28 @@ class FeishuStreamingResponder:
         now = self.now_provider()
         if not force and now - self.last_flush_at < self.update_interval_seconds:
             return
+        if not final and self.non_final_update_count >= self.max_update_count:
+            return
         rendered = self._render_final() if final else self._render_progress()
         if not rendered:
             return
-        if self.patch_available and self.reply_message_id:
+        stream_expired = now - self.stream_started_at > self.max_stream_seconds
+        if stream_expired:
+            log_event(
+                "stream_fallback_used",
+                level=logging.WARNING,
+                reply_message_id=self.reply_message_id,
+                final=final,
+                reason="max_stream_seconds_exceeded",
+                elapsed_seconds=round(now - self.stream_started_at, 1),
+                max_stream_seconds=self.max_stream_seconds,
+            )
+        if self.update_available and self.reply_message_id and not stream_expired:
             try:
-                self.client.patch_text(self.reply_message_id, rendered)
+                self.client.update_text(self.reply_message_id, rendered)
                 self.last_flush_at = now
+                if not final:
+                    self.non_final_update_count += 1
                 log_event(
                     "stream_update_sent",
                     final=final,
@@ -121,7 +148,7 @@ class FeishuStreamingResponder:
                 )
                 return
             except Exception as exc:  # noqa: BLE001
-                self.patch_available = False
+                self.update_available = False
                 log_exception(
                     "stream_fallback_used",
                     exc,
@@ -133,13 +160,13 @@ class FeishuStreamingResponder:
             self.last_flush_at = now
 
     def _render_progress(self) -> str:
-        lines = [f"状态：{self.status_text or '正在处理...'}"]
+        lines = [THINKING_REPLY_TEXT, f"当前进度：{self.status_text or THINKING_REPLY_TEXT}"]
         if self.answer_text.strip():
             lines.extend(["", "已生成：", self._truncate(self.answer_text)])
         return "\n".join(lines)
 
     def _render_final(self) -> str:
-        return self._truncate(self.answer_text).strip() or "处理完成。"
+        return self._truncate(self.answer_text).strip() or _EMPTY_FINAL_TEXT
 
     def _truncate(self, text: str) -> str:
         if len(text) <= self.max_chars:

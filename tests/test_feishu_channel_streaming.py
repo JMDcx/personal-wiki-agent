@@ -10,14 +10,14 @@ from protocols.streaming import StreamEvent
 class _FakeClient:
     def __init__(self) -> None:
         self.replies: list[tuple[str, str]] = []
-        self.patches: list[tuple[str, str]] = []
+        self.updates: list[tuple[str, str]] = []
 
     def reply_text(self, message_id: str, text: str) -> str:
         self.replies.append((message_id, text))
         return "om_stream"
 
-    def patch_text(self, message_id: str, text: str) -> None:
-        self.patches.append((message_id, text))
+    def update_text(self, message_id: str, text: str) -> None:
+        self.updates.append((message_id, text))
 
 
 def _event(message_id: str = "om_source") -> dict:
@@ -58,8 +58,8 @@ def test_feishu_channel_uses_streaming_runner_when_enabled():
     assert answer == "流式答案"
     assert stream_calls[0][0] == "你好"
     assert stream_calls[0][1] == "feishu:oc_chat"
-    assert client.replies == [("om_source", "正在处理...")]
-    assert client.patches[-1] == ("om_stream", "流式答案")
+    assert client.replies == [("om_source", "thinking...")]
+    assert client.updates[-1] == ("om_stream", "流式答案")
 
 
 def test_feishu_channel_keeps_sync_runner_when_streaming_disabled():
@@ -83,4 +83,4 @@ def test_feishu_channel_keeps_sync_runner_when_streaming_disabled():
 
     assert answer == "同步答案：你好:feishu:oc_chat:p2p"
     assert client.replies == [("om_sync", "同步答案：你好:feishu:oc_chat:p2p")]
-    assert client.patches == []
+    assert client.updates == []

@@ -142,10 +142,16 @@ class Settings:
     )
     feishu_streaming_enabled: bool = field(default_factory=lambda: _bool_env("FEISHU_STREAMING_ENABLED", True))
     feishu_streaming_update_interval_ms: int = field(
-        default_factory=lambda: int(os.getenv("FEISHU_STREAMING_UPDATE_INTERVAL_MS", "1500"))
+        default_factory=lambda: int(os.getenv("FEISHU_STREAMING_UPDATE_INTERVAL_MS", "2500"))
     )
     feishu_streaming_max_chars: int = field(
         default_factory=lambda: int(os.getenv("FEISHU_STREAMING_MAX_CHARS", "6000"))
+    )
+    feishu_group_concurrency_mode: str = field(
+        default_factory=lambda: os.getenv("FEISHU_GROUP_CONCURRENCY_MODE", "member").strip().lower() or "member"
+    )
+    feishu_group_memory_recent_turns: int = field(
+        default_factory=lambda: int(os.getenv("FEISHU_GROUP_MEMORY_RECENT_TURNS", "6"))
     )
     bot_concurrency_enabled: bool = field(default_factory=lambda: _bool_env("BOT_CONCURRENCY_ENABLED", True))
     bot_concurrency_workers: int = field(default_factory=lambda: int(os.getenv("BOT_CONCURRENCY_WORKERS", "4")))

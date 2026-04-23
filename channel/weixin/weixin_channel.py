@@ -56,6 +56,7 @@ MAX_CONSECUTIVE_FAILURES = 3
 RETRY_DELAY = 2
 BACKOFF_DELAY = 30
 BUSY_REPLY_TEXT = "当前排队较多，请稍后再试"
+THINKING_REPLY_TEXT = "thinking..."
 
 
 @dataclass
@@ -265,15 +266,17 @@ class WeixinChannel:
             return
 
         timing: dict[str, float] = {}
+        thinking_reply_ready = threading.Event()
 
         def _on_started(context: DispatchContext) -> None:
             timing["queue_ms"] = context.queue_ms
 
         def _run_message() -> str | None:
+            thinking_reply_ready.wait()
             with bind_log_context(**context_fields):
                 return self.handle_raw_message(raw_msg, dispatch_queue_ms=timing.get("queue_ms"))
 
-        self.dispatcher.submit(
+        result = self.dispatcher.submit(
             thread_id,
             _run_message,
             on_started=_on_started,
@@ -286,6 +289,9 @@ class WeixinChannel:
                 "transport": "long_poll",
             },
         )
+        if result.accepted:
+            self._reply_text(from_user_id, context_token, THINKING_REPLY_TEXT)
+        thinking_reply_ready.set()
 
     def _prime_cursor(self) -> None:
         """Drain the startup backlog to establish a cursor baseline before normal polling."""
