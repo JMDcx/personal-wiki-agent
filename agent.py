@@ -61,6 +61,7 @@ from multimodal_rag_agent.deposit_pipeline.pipeline import DepositPipeline
 try:
     from feishu_wiki_rag_agent.protocols.controller_models import ControllerDecision
     from feishu_wiki_rag_agent.protocols.renderers import render_deposit_result_text, render_retrieval_result_text
+    from feishu_wiki_rag_agent.protocols.streaming import StreamEvent
     from feishu_wiki_rag_agent.protocols.tool_models import (
         DepositRequestContext,
         DepositResult,
@@ -70,6 +71,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from protocols.controller_models import ControllerDecision
     from protocols.renderers import render_deposit_result_text, render_retrieval_result_text
+    from protocols.streaming import StreamEvent
     from protocols.tool_models import DepositRequestContext, DepositResult, RetrievalRequest, RetrievalResult
 
 try:
@@ -1016,7 +1018,45 @@ def extract_final_text(result: dict[str, Any]) -> str:
     return "当前索引中未找到相关内容。"
 
 
-def invoke_agent(
+def _status_for_intent(intent: str) -> tuple[str, str]:
+    if intent == "knowledge_deposit":
+        return "deposit", "正在解析材料并沉淀到知识库..."
+    if _intent_requires_retrieval(intent):
+        return "retrieval", "正在检索知识库..."
+    if intent == "image_only":
+        return "generation", "正在整理图片理解结果..."
+    return "generation", "正在生成回复..."
+
+
+def _coerce_stream_part(part: Any) -> tuple[str, Any]:
+    if isinstance(part, tuple) and len(part) == 2 and part[0] in {"messages", "updates", "values"}:
+        return str(part[0]), part[1]
+    return "values", part
+
+
+def _extract_stream_text_delta(data: Any) -> str:
+    if not isinstance(data, tuple) or len(data) != 2:
+        return ""
+    message, metadata = data
+    if isinstance(metadata, dict) and metadata.get("langgraph_node") not in {"model", None}:
+        return ""
+    if getattr(message, "tool_call_chunks", None) or getattr(message, "tool_calls", None):
+        return ""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text_parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                text_parts.append(item["text"])
+        return "".join(text_parts)
+    return ""
+
+
+def invoke_agent_stream(
     question: str,
     *,
     settings: Settings | None = None,
@@ -1024,8 +1064,9 @@ def invoke_agent(
     images: list[str] | None = None,
     message_context: dict[str, object] | None = None,
     language: str = "中文",
-) -> str:
-    """Run the Deep Agent orchestrator backed by the multimodal RAG pipeline."""
+    raise_errors: bool = False,
+):
+    """Run the agent and yield user-safe progress and answer events."""
     resolved = settings or get_settings()
     configure_logging(resolved)
     multimodal_settings = get_multimodal_settings()
@@ -1045,6 +1086,7 @@ def invoke_agent(
             question_preview=_question_preview(question),
             image_count=len(images or []),
         )
+        yield StreamEvent.started("开始处理", stage="started")
         try:
             agent = _get_or_build_agent_runtime(resolved)
             runtime_thread_id = _runtime_thread_id(thread_id)
@@ -1054,6 +1096,7 @@ def invoke_agent(
                     thread_id=thread_id,
                     runtime_thread_id=runtime_thread_id,
                 )
+            yield StreamEvent.status("正在理解问题...", stage="intent")
             controller_context = _build_controller_context(
                 question=question,
                 thread_id=thread_id,
@@ -1064,6 +1107,8 @@ def invoke_agent(
                 multimodal_settings=multimodal_settings,
                 agent_runtime=agent,
             )
+            status_stage, status_text = _status_for_intent(controller_context.intent)
+            yield StreamEvent.status(status_text, stage=status_stage, metadata={"intent": controller_context.intent})
             if controller_context.intent == "knowledge_deposit":
                 raw_message_context = message_context if isinstance(message_context, dict) else {}
                 fast_path_started_at = perf_counter()
@@ -1097,7 +1142,10 @@ def invoke_agent(
                     answer_length=len(final_text),
                     fast_path="knowledge_deposit",
                 )
-                return final_text
+                if owns_request_state:
+                    emit_request_summary(status="ok")
+                yield StreamEvent.final(final_text)
+                return
             invoke_thread_id = _runtime_invoke_thread_id(runtime_thread_id, controller_context.intent)
             if invoke_thread_id != runtime_thread_id:
                 log_event(
@@ -1114,13 +1162,22 @@ def invoke_agent(
             messages.append({"role": "user", "content": controller_context.user_content})
 
             invoke_started_at = perf_counter()
-            result = agent.invoke(
+            final_state: dict[str, Any] = {}
+            for part in agent.stream(
                 {"messages": messages},
                 config={"configurable": {"thread_id": invoke_thread_id}},
-            )
+                stream_mode=["messages", "values"],
+            ):
+                mode, data = _coerce_stream_part(part)
+                if mode == "messages":
+                    delta = _extract_stream_text_delta(data)
+                    if delta:
+                        yield StreamEvent.text_delta(delta, stage="generation")
+                elif mode == "values" and isinstance(data, dict):
+                    final_state = data
             invoke_elapsed_ms = (perf_counter() - invoke_started_at) * 1000
             record_request_timing("llm_ms", invoke_elapsed_ms)
-            final_text = extract_final_text(result)
+            final_text = extract_final_text(final_state)
             update_request_state(
                 intent=controller_context.intent,
                 allow_retrieval=_intent_requires_retrieval(controller_context.intent),
@@ -1139,7 +1196,7 @@ def invoke_agent(
             )
             if owns_request_state:
                 emit_request_summary(status="ok")
-            return final_text
+            yield StreamEvent.final(final_text)
         except Exception as exc:  # noqa: BLE001
             update_request_state(
                 question_preview=_question_preview(question),
@@ -1153,4 +1210,31 @@ def invoke_agent(
                     question_preview=_question_preview(question),
                 )
                 emit_request_summary(status="error", level=logging.ERROR)
-            raise
+            if raise_errors:
+                raise
+            yield StreamEvent.error("处理失败，请稍后重试。")
+
+
+def invoke_agent(
+    question: str,
+    *,
+    settings: Settings | None = None,
+    thread_id: str = "default",
+    images: list[str] | None = None,
+    message_context: dict[str, object] | None = None,
+    language: str = "中文",
+) -> str:
+    """Run the Deep Agent orchestrator backed by the multimodal RAG pipeline."""
+    final_text = ""
+    for event in invoke_agent_stream(
+        question,
+        settings=settings,
+        thread_id=thread_id,
+        images=images,
+        message_context=message_context,
+        language=language,
+        raise_errors=True,
+    ):
+        if event.event_type in {"final", "error"}:
+            final_text = event.text
+    return final_text or "当前索引中未找到相关内容。"

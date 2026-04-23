@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -25,9 +26,11 @@ if __package__ in {None, ""}:  # pragma: no cover - script execution fallback
         sys.path.insert(0, repo_root_str)
 
 try:
-    from feishu_wiki_rag_agent.agent import invoke_agent
+    from feishu_wiki_rag_agent.agent import invoke_agent, invoke_agent_stream
     from feishu_wiki_rag_agent.config import Settings, get_settings
+    from feishu_wiki_rag_agent.channel.dispatcher import ConcurrentMessageDispatcher, DispatchContext
     from feishu_wiki_rag_agent.channel.feishu.feishu_client import FeishuClient
+    from feishu_wiki_rag_agent.channel.feishu.streaming import FeishuStreamingResponder
     from feishu_wiki_rag_agent.multimodal_rag_agent.deposit_pipeline.adapters import extract_urls
     from feishu_wiki_rag_agent.multimodal_rag_agent.deposit_pipeline.models import InlineImage
     from feishu_wiki_rag_agent.multimodal_rag_agent.docreader_service.client import DocreaderService
@@ -48,9 +51,11 @@ try:
     from feishu_wiki_rag_agent.observability.logging import configure_logging
     from feishu_wiki_rag_agent.schemas import IncomingMessage, MentionRef, ReplyContext
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
-    from agent import invoke_agent
+    from agent import invoke_agent, invoke_agent_stream
     from config import Settings, get_settings
+    from channel.dispatcher import ConcurrentMessageDispatcher, DispatchContext
     from channel.feishu.feishu_client import FeishuClient
+    from channel.feishu.streaming import FeishuStreamingResponder
     from multimodal_rag_agent.deposit_pipeline.adapters import extract_urls
     from multimodal_rag_agent.deposit_pipeline.models import InlineImage
     from multimodal_rag_agent.docreader_service.client import DocreaderService
@@ -66,6 +71,7 @@ lark = None
 
 logging.getLogger("Lark").setLevel(logging.WARNING)
 MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
+BUSY_REPLY_TEXT = "当前排队较多，请稍后再试"
 
 
 @dataclass
@@ -144,15 +150,17 @@ class MessageDeduper:
 
     ttl_seconds: int = 60 * 60
     _seen: dict[str, float] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def should_process(self, message_id: str, now: float | None = None) -> bool:
         """Return whether the message should be processed."""
         current = now if now is not None else time.time()
-        self._seen = {key: ts for key, ts in self._seen.items() if current - ts < self.ttl_seconds}
-        if message_id in self._seen:
-            return False
-        self._seen[message_id] = current
-        return True
+        with self._lock:
+            self._seen = {key: ts for key, ts in self._seen.items() if current - ts < self.ttl_seconds}
+            if message_id in self._seen:
+                return False
+            self._seen[message_id] = current
+            return True
 
 
 class FeishuChannel:
@@ -164,8 +172,10 @@ class FeishuChannel:
         *,
         client: FeishuClient | None = None,
         agent_runner: Callable[[str, str, dict[str, object] | None], str] | None = None,
+        streaming_agent_runner: Callable[[str, str, dict[str, object] | None], object] | None = None,
         deduper: MessageDeduper | None = None,
         instance_guard: SingleInstanceGuard | None = None,
+        dispatcher: ConcurrentMessageDispatcher | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.client = client or FeishuClient(self.settings)
@@ -177,13 +187,44 @@ class FeishuChannel:
                 message_context=message_context,
             )
         )
-        self.docreader = DocreaderService()
+        self.streaming_agent_runner = streaming_agent_runner or (
+            lambda text, thread_id, message_context=None: invoke_agent_stream(
+                text,
+                settings=self.settings,
+                thread_id=thread_id,
+                message_context=message_context,
+            )
+        )
+        self._docreader_local = threading.local()
         self.deduper = deduper or MessageDeduper()
         self.instance_guard = instance_guard or SingleInstanceGuard(
             self.settings.rag_data_dir / "locks" / "feishu_channel.lock"
         )
+        self.dispatcher = dispatcher or self._build_dispatcher()
         self.bot_open_id: str | None = None
         self._startup_cutoff_ms: int = 0  # connection-start cutoff in epoch ms
+
+    def _build_dispatcher(self) -> ConcurrentMessageDispatcher | None:
+        if not self.settings.bot_concurrency_enabled:
+            return None
+        return ConcurrentMessageDispatcher(
+            max_workers=self.settings.bot_concurrency_workers,
+            queue_size=self.settings.bot_concurrency_queue_size,
+            per_thread_serial=self.settings.bot_concurrency_per_thread_serial,
+            thread_name_prefix="feishu-message-dispatcher",
+        )
+
+    def shutdown(self) -> None:
+        """Release channel-owned worker resources."""
+        if self.dispatcher is not None:
+            self.dispatcher.shutdown(wait=True)
+
+    def _get_docreader(self) -> DocreaderService:
+        service = getattr(self._docreader_local, "service", None)
+        if service is None:
+            service = DocreaderService()
+            self._docreader_local.service = service
+        return service
 
     def run(self) -> None:
         """Start the websocket client and listen for Feishu messages."""
@@ -263,13 +304,18 @@ class FeishuChannel:
         chat_id = str(message.get("chat_id", ""))
         thread_id = f"feishu:{chat_id}" if chat_id else ""
         request_id = f"feishu:{message_id}" if message_id else ""
-        with bind_log_context(
-            request_id=request_id,
-            thread_id=thread_id,
-            channel="feishu",
-            message_id=message_id,
-            chat_id=chat_id,
-        ):
+        context_fields = {
+            "request_id": request_id,
+            "thread_id": thread_id,
+            "channel": "feishu",
+            "message_id": message_id,
+            "chat_id": chat_id,
+        }
+        if self.settings.bot_concurrency_enabled and self.dispatcher is not None:
+            self._submit_event(event, context_fields)
+            return
+
+        with bind_log_context(**context_fields):
             try:
                 self.handle_event(event)
             except Exception as exc:  # noqa: BLE001
@@ -282,8 +328,79 @@ class FeishuChannel:
                     chat_id=chat_id,
                 )
 
-    def handle_event(self, event: dict) -> str | None:
+    def _submit_event(self, event: dict, context_fields: dict[str, object]) -> None:
+        thread_id = str(context_fields.get("thread_id", "") or "feishu:unknown")
+        message_id = str(context_fields.get("message_id", "") or "")
+        chat_id = str(context_fields.get("chat_id", "") or "")
+        timing: dict[str, float] = {}
+
+        def _on_started(context: DispatchContext) -> None:
+            timing["queue_ms"] = context.queue_ms
+
+        def _run_event() -> str | None:
+            with bind_log_context(**context_fields):
+                try:
+                    return self.handle_event(event, dispatch_queue_ms=timing.get("queue_ms"))
+                except Exception as exc:  # noqa: BLE001
+                    log_exception(
+                        "channel_dispatch_failed",
+                        exc,
+                        stage="feishu_websocket_dispatch",
+                        channel="feishu",
+                        message_id=message_id,
+                        chat_id=chat_id,
+                    )
+                    return None
+
+        self.dispatcher.submit(
+            thread_id,
+            _run_event,
+            on_started=_on_started,
+            on_rejected=lambda: self._reply_busy_if_targeted(event),
+            metadata={
+                "request_id": str(context_fields.get("request_id", "") or ""),
+                "channel": "feishu",
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "transport": "websocket",
+            },
+        )
+
+    def _reply_busy_if_targeted(self, event: dict) -> None:
+        message = event.get("message", {}) if isinstance(event, dict) else {}
+        if not isinstance(message, dict):
+            return
+        message_id = str(message.get("message_id", "")).strip()
+        if not message_id or str(message.get("message_type", "")) != "text":
+            return
+        chat_type = str(message.get("chat_type", ""))
+        mentions = message.get("mentions", [])
+        if chat_type == "group":
+            if not isinstance(mentions, list) or not mentions:
+                return
+            if not self._mentions_bot(mentions):
+                return
+        try:
+            self.client.reply_text(message_id, BUSY_REPLY_TEXT)
+            log_event(
+                "reply_sent",
+                reply_channel="feishu",
+                reason="dispatch_rejected",
+                answer_length=len(BUSY_REPLY_TEXT),
+                answer_preview=BUSY_REPLY_TEXT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_exception(
+                "dispatch_rejection_reply_failed",
+                exc,
+                stage="feishu_busy_reply",
+                channel="feishu",
+                message_id=message_id,
+            )
+
+    def handle_event(self, event: dict, *, dispatch_queue_ms: float | None = None) -> str | None:
         """Parse and process a single Feishu event."""
+        worker_started_at = perf_counter()
         incoming = self._parse_incoming_message(event)
         if incoming is None:
             return None
@@ -313,6 +430,8 @@ class FeishuChannel:
                 mentioned_users=incoming.mentioned_users,
                 question_preview=preview_text(incoming.text),
             )
+            if dispatch_queue_ms is not None:
+                record_request_timing("queue_ms", dispatch_queue_ms)
             log_event(
                 "message_normalized",
                 chat_type=incoming.chat_type,
@@ -331,11 +450,21 @@ class FeishuChannel:
             )
             try:
                 agent_text, message_context = self._build_agent_turn(incoming)
-                answer = self.agent_runner(agent_text, thread_id, message_context)
                 reply_started_at = perf_counter()
-                self.client.reply_text(incoming.message_id, answer)
+                if self.settings.feishu_streaming_enabled:
+                    responder = FeishuStreamingResponder(
+                        client=self.client,
+                        source_message_id=incoming.message_id,
+                        update_interval_seconds=self.settings.feishu_streaming_update_interval_ms / 1000,
+                        max_chars=self.settings.feishu_streaming_max_chars,
+                    )
+                    answer = responder.run(self.streaming_agent_runner(agent_text, thread_id, message_context))
+                else:
+                    answer = self.agent_runner(agent_text, thread_id, message_context)
+                    self.client.reply_text(incoming.message_id, answer)
                 reply_elapsed_ms = (perf_counter() - reply_started_at) * 1000
                 record_request_timing("reply_ms", reply_elapsed_ms)
+                record_request_timing("worker_ms", (perf_counter() - worker_started_at) * 1000)
                 update_request_state(
                     reply_channel="feishu",
                     answer_length=len(answer),
@@ -351,6 +480,7 @@ class FeishuChannel:
                 emit_request_summary(status="ok")
                 return answer
             except Exception as exc:  # noqa: BLE001
+                record_request_timing("worker_ms", (perf_counter() - worker_started_at) * 1000)
                 log_exception(
                     "request_failed",
                     exc,
@@ -392,7 +522,7 @@ class FeishuChannel:
         }
 
     def _parse_url(self, url: str) -> ParsedDocument:
-        parsed = self.docreader.parse(ParseRequest(url=url, title=url))
+        parsed = self._get_docreader().parse(ParseRequest(url=url, title=url))
         if not parsed.markdown_content.strip():
             raise RuntimeError(f"链接解析失败：{url}")
         return parsed

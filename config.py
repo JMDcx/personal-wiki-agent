@@ -140,6 +140,21 @@ class Settings:
     feishu_lark_cli_profile: str = field(
         default_factory=lambda: os.getenv("FEISHU_LARK_CLI_PROFILE", "feishu-wiki-rag-agent")
     )
+    feishu_streaming_enabled: bool = field(default_factory=lambda: _bool_env("FEISHU_STREAMING_ENABLED", True))
+    feishu_streaming_update_interval_ms: int = field(
+        default_factory=lambda: int(os.getenv("FEISHU_STREAMING_UPDATE_INTERVAL_MS", "1500"))
+    )
+    feishu_streaming_max_chars: int = field(
+        default_factory=lambda: int(os.getenv("FEISHU_STREAMING_MAX_CHARS", "6000"))
+    )
+    bot_concurrency_enabled: bool = field(default_factory=lambda: _bool_env("BOT_CONCURRENCY_ENABLED", True))
+    bot_concurrency_workers: int = field(default_factory=lambda: int(os.getenv("BOT_CONCURRENCY_WORKERS", "4")))
+    bot_concurrency_queue_size: int = field(
+        default_factory=lambda: int(os.getenv("BOT_CONCURRENCY_QUEUE_SIZE", "32"))
+    )
+    bot_concurrency_per_thread_serial: bool = field(
+        default_factory=lambda: _bool_env("BOT_CONCURRENCY_PER_THREAD_SERIAL", True)
+    )
     xhs_mcp_url: str = field(default_factory=lambda: os.getenv("XHS_MCP_URL", "http://127.0.0.1:18060/mcp"))
     deposit_enable_auto_write: bool = field(
         default_factory=lambda: os.getenv("DEPOSIT_ENABLE_AUTO_WRITE", "true").strip().lower() not in {"0", "false", "no"}

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ class FeishuClient:
     def __init__(self, settings: Settings | None = None, *, cli_runner: Any | None = None):
         self.settings = settings or get_settings()
         self._token_cache = _TokenCache()
+        self._token_lock = threading.Lock()
         self.cli_runner = cli_runner or subprocess.run
 
     def _request(
@@ -106,19 +108,24 @@ class FeishuClient:
         if self._token_cache.value and now < self._token_cache.expires_at:
             return self._token_cache.value
 
-        payload = self._request(
-            "POST",
-            "/open-apis/auth/v3/tenant_access_token/internal",
-            json_body={
-                "app_id": self.settings.feishu_app_id,
-                "app_secret": self.settings.feishu_app_secret,
-            },
-            auth=False,
-        )
-        token = str(payload["tenant_access_token"])
-        expires_in = int(payload.get("expire", 7200))
-        self._token_cache = _TokenCache(value=token, expires_at=now + max(expires_in - 60, 60))
-        return token
+        with self._token_lock:
+            now = time.time()
+            if self._token_cache.value and now < self._token_cache.expires_at:
+                return self._token_cache.value
+
+            payload = self._request(
+                "POST",
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                json_body={
+                    "app_id": self.settings.feishu_app_id,
+                    "app_secret": self.settings.feishu_app_secret,
+                },
+                auth=False,
+            )
+            token = str(payload["tenant_access_token"])
+            expires_in = int(payload.get("expire", 7200))
+            self._token_cache = _TokenCache(value=token, expires_at=now + max(expires_in - 60, 60))
+            return token
 
     def fetch_bot_open_id(self) -> str | None:
         """Fetch the bot's open_id for mention matching."""
@@ -127,14 +134,29 @@ class FeishuClient:
         open_id = bot.get("open_id")
         return str(open_id) if open_id else None
 
-    def reply_text(self, message_id: str, text: str) -> None:
-        """Reply to a Feishu message with plain text."""
-        self._request(
+    def reply_text(self, message_id: str, text: str) -> str:
+        """Reply to a Feishu message with plain text and return the created message id."""
+        payload = self._request(
             "POST",
             f"/open-apis/im/v1/messages/{message_id}/reply",
             json_body={
                 "content": json.dumps({"text": text}, ensure_ascii=False),
                 "msg_type": "text",
+            },
+        )
+        data = payload.get("data", {})
+        created_message_id = str(data.get("message_id") or "").strip()
+        if not created_message_id and isinstance(data.get("message"), dict):
+            created_message_id = str(data["message"].get("message_id") or "").strip()
+        return created_message_id
+
+    def patch_text(self, message_id: str, text: str) -> None:
+        """Patch a bot-sent Feishu text message in place."""
+        self._request(
+            "PATCH",
+            f"/open-apis/im/v1/messages/{message_id}",
+            json_body={
+                "content": json.dumps({"text": text}, ensure_ascii=False),
             },
         )
 
