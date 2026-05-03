@@ -67,10 +67,10 @@ feishu_wiki_rag_agent/
 ├── config.py
 ├── channel/
 │   ├── __init__.py
-│   └── feishu/
-│       ├── __init__.py
-│       ├── feishu_channel.py
-│       └── feishu_client.py
+│   ├── feishu/
+│   │   ├── __init__.py
+│   │   ├── feishu_channel.py
+│   │   └── feishu_client.py
 │   └── weixin/
 │       ├── __init__.py
 │       ├── weixin_api.py
@@ -90,18 +90,19 @@ feishu_wiki_rag_agent/
 ├── scripts/
 │   └── verify_xhs_deposit.py
 ├── skills/
-│   └── knowledge-qa/
-│       └── SKILL.md
+│   ├── knowledge-qa/
+│   │   └── SKILL.md
 │   └── knowledge-deposit/
 │       └── SKILL.md
 ├── tools/
 │   └── xiaohongshu-bin/
 │       └── README.md
 ├── tests/
-│   ├── test_agent_controller_flow.py
+│   ├── test_agent_history_sanitization.py
+│   ├── test_channel_concurrency.py
+│   ├── test_feishu_group_memory.py
 │   ├── test_query_understand_service.py
-│   ├── test_sqlite_checkpointer.py
-│   └── test_weixin_channel.py
+│   └── test_streaming_protocol.py
 └── .env.example
 ```
 
@@ -139,6 +140,8 @@ docker run -d \
 docker compose up -d qdrant
 ```
 
+如果 Docker 提示 `6333` 端口已被占用，先检查是否已经有其它 Qdrant 容器在运行；可以直接复用已有服务，或者停止旧容器后再启动当前 Compose 服务。
+
 ## 配置
 
 将 `.env.example` 复制为 `.env`，然后填写你的配置。
@@ -159,22 +162,28 @@ FEISHU_RAG_EMBEDDING_MODEL=your_embedding_model_name
 FEISHU_RAG_EMBEDDING_API_KEY=your_embedding_api_key
 FEISHU_RAG_EMBEDDING_BASE_URL=https://your-embedding-compatible-endpoint/v1
 
-FEISHU_INTENT_MODEL_ID=your-org/your-private-intent-model
-HF_TOKEN=your_huggingface_token_for_private_model
+# 生产环境意图模型加载：
+# FEISHU_INTENT_MODEL_ID=your-org/your-private-intent-model
+# HF_TOKEN=your_huggingface_token_for_private_model
+
+# 本地开发意图模型加载：
+# FEISHU_INTENT_MODEL_PATH=./intent_model
 ```
 
 注意：
 - 如果你使用 Qwen embedding，模型名请保持 provider 要求的小写形式，例如 `qwen3-embedding-4b`
 - 如果你拿到的是飞书 wiki 链接，例如 `https://.../wiki/HjPjwGtbrikafFkN6sdcSe9zn0d`，则 `FEISHU_WIKI_ROOT_TOKENS` 应填写链接末尾的 node token，即 `HjPjwGtbrikafFkN6sdcSe9zn0d`
-- 意图模型应使用私有 Hugging Face SetFit 仓库。开发时可以设置 `FEISHU_INTENT_MODEL_PATH` 指向本地模型目录，它会优先于 `FEISHU_INTENT_MODEL_ID`。
+- 意图 gate 支持五类标签：`greeting`、`knowledge_deposit`、`kb_search`、`follow_up`、`chitchat`。
+- 生产环境建议通过 `FEISHU_INTENT_MODEL_ID` 和 `HF_TOKEN` 从 Hugging Face 私有仓库加载意图模型。
+- 本地开发可以设置 `FEISHU_INTENT_MODEL_PATH` 指向本地模型目录；它会优先于 Hugging Face 模型 ID。
 
 可选变量：
 
 ```env
-FEISHU_RAG_TOP_K=4
 FEISHU_RAG_COLLECTION=feishu_wiki_docs
 FEISHU_RAG_DATA_DIR=./data
 FEISHU_RAG_MANIFEST=index_manifest.json
+FEISHU_AGENT_CHECKPOINT_DB_PATH=./data/deepagents/checkpoints.sqlite
 FEISHU_API_BASE=https://open.feishu.cn
 FEISHU_REQUEST_TIMEOUT=20
 WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com
@@ -187,10 +196,20 @@ BOT_CONCURRENCY_ENABLED=true
 BOT_CONCURRENCY_WORKERS=4
 BOT_CONCURRENCY_QUEUE_SIZE=32
 BOT_CONCURRENCY_PER_THREAD_SERIAL=true
+FEISHU_STREAMING_ENABLED=true
+FEISHU_STREAMING_UPDATE_INTERVAL_MS=2500
+FEISHU_STREAMING_MAX_CHARS=6000
+FEISHU_GROUP_CONCURRENCY_MODE=member
+FEISHU_GROUP_MEMORY_RECENT_TURNS=6
+FEISHU_DAILY_HISTORY_CLEANUP_ENABLED=true
+FEISHU_HISTORY_CLEANUP_CHECK_INTERVAL_SECONDS=3600
 
 MULTIMODAL_RAG_QDRANT_URL=http://127.0.0.1:6333
 MULTIMODAL_RAG_QDRANT_API_KEY=
 MULTIMODAL_RAG_QDRANT_COLLECTION=feishu_wiki_docs
+MULTIMODAL_RAG_CHAT_MODEL=
+MULTIMODAL_RAG_VLM_MODEL=
+MULTIMODAL_RAG_EMBEDDING_MODEL=
 MULTIMODAL_RAG_VECTOR_SIZE=1536
 MULTIMODAL_RAG_TOP_K=6
 MULTIMODAL_RAG_RERANK_TOP_K=4
@@ -215,6 +234,25 @@ XHS_MCP_URL=http://127.0.0.1:18060/mcp
 如果你已经拿到了可复用的 Weixin iLink token，也可以直接设置：
 
 - `WEIXIN_TOKEN`
+
+### 模型选择
+
+- `FEISHU_RAG_MODEL` 是主运行时模型。主控 agent 和子 agent 都会使用它，包括 `knowledge_retriever` 和 `knowledge_depositor`；这是影响飞书实际回复延迟的最关键配置。
+- `MULTIMODAL_RAG_CHAT_MODEL` 主要用于独立的多模态 RAG answer generator，例如直接调用 `RAGQueryPipeline.run()` 或 API query 流程。飞书 Deep Agent 主链路会使用 RAG pipeline 返回的检索上下文，但最终回答由 `FEISHU_RAG_MODEL` 生成。
+- `MULTIMODAL_RAG_VLM_MODEL` 用于图片 OCR、caption 和视觉理解，主要出现在图片索引或图片沉淀链路中。
+- `MULTIMODAL_RAG_EMBEDDING_MODEL` 用于入库和检索向量。如果更换该模型，需要重建索引，并同步调整 `MULTIMODAL_RAG_VECTOR_SIZE` 为 provider 输出维度。
+
+如果是纯文本部署，建议 `FEISHU_RAG_MODEL` 使用较快的文本模型，把 VLM 模型单独保留在 `MULTIMODAL_RAG_VLM_MODEL`。
+
+### 对话历史清理
+
+飞书通道会把 Deep Agent checkpoint 存在 `data/deepagents/checkpoints.sqlite`，用于保留 thread 历史。为了避免 24 小时运行时上下文无限增长，通道默认启用每日维护任务：
+
+- `FEISHU_DAILY_HISTORY_CLEANUP_ENABLED=true` 启用清理线程。
+- `FEISHU_HISTORY_CLEANUP_CHECK_INTERVAL_SECONDS=3600` 每小时检查一次当天是否已清理。
+- 每天删除一次 thread id 以 `feishu__` 开头的飞书运行时 checkpoint。
+- 将 `data/group_memory/feishu/` 下的群聊 memory 文件压缩到最近 `FEISHU_GROUP_MEMORY_RECENT_TURNS` 轮。
+- 清理记录会写入 `data/maintenance/feishu_history_cleanup.json`。
 
 ## 小红书 MCP 部署
 
@@ -450,11 +488,19 @@ uv run python channel/weixin/weixin_channel.py
 - 图片会通过现有 `images=[...]` 接口传给 agent
 - 文件会先本地解析为 markdown，并附带解析出的图片上下文
 
+## 常见问题
+
+- `processor not found, type: im.message.message_read_v1`：这是 Lark SDK 收到未注册的已读回执事件时产生的噪音日志，不会影响正常收消息和回复。
+- Qdrant connection refused：请确认 Qdrant 已经在 `MULTIMODAL_RAG_QDRANT_URL` 上监听，通常是 `http://127.0.0.1:6333`。
+- 意图模型加载来源不符合预期：`FEISHU_INTENT_MODEL_PATH` 优先级高于 `FEISHU_INTENT_MODEL_ID`。如果要测试 Hugging Face 加载，请先取消本地路径。
+- 飞书回复慢：看 `request_summary` 里的 `intent_ms`、`retrieval_ms` 和 `llm_ms`。如果主要慢在 `llm_ms`，优先尝试更快的 `FEISHU_RAG_MODEL`。
+
 ## 说明
 
 - 当前版本仅支持 `FEISHU_EVENT_MODE=websocket`
 - 当前飞书主运行时使用 Deep Agents 作为编排层
 - 文档检索被委派给专门的 `knowledge_retriever` 子 agent
+- 飞书对话 checkpoint 默认每天清理一次，避免上下文无限增长
 - 当前项目即使索引了图片 OCR/caption chunk，也只返回文本回复
 - 群聊中只有在 @ 机器人时才会触发回复
 - 微信第一版只支持个人单聊和文本回复

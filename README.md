@@ -67,10 +67,10 @@ feishu_wiki_rag_agent/
 ├── config.py
 ├── channel/
 │   ├── __init__.py
-│   └── feishu/
-│       ├── __init__.py
-│       ├── feishu_channel.py
-│       └── feishu_client.py
+│   ├── feishu/
+│   │   ├── __init__.py
+│   │   ├── feishu_channel.py
+│   │   └── feishu_client.py
 │   └── weixin/
 │       ├── __init__.py
 │       ├── weixin_api.py
@@ -90,18 +90,19 @@ feishu_wiki_rag_agent/
 ├── scripts/
 │   └── verify_xhs_deposit.py
 ├── skills/
-│   └── knowledge-qa/
-│       └── SKILL.md
+│   ├── knowledge-qa/
+│   │   └── SKILL.md
 │   └── knowledge-deposit/
 │       └── SKILL.md
 ├── tools/
 │   └── xiaohongshu-bin/
 │       └── README.md
 ├── tests/
-│   ├── test_agent_controller_flow.py
+│   ├── test_agent_history_sanitization.py
+│   ├── test_channel_concurrency.py
+│   ├── test_feishu_group_memory.py
 │   ├── test_query_understand_service.py
-│   ├── test_sqlite_checkpointer.py
-│   └── test_weixin_channel.py
+│   └── test_streaming_protocol.py
 └── .env.example
 ```
 
@@ -139,6 +140,8 @@ You can also use the included Compose file:
 docker compose up -d qdrant
 ```
 
+If Docker reports that port `6333` is already allocated, check whether another Qdrant container is already running and either reuse it or stop the old container before starting this one.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in your values.
@@ -159,22 +162,28 @@ FEISHU_RAG_EMBEDDING_MODEL=your_embedding_model_name
 FEISHU_RAG_EMBEDDING_API_KEY=your_embedding_api_key
 FEISHU_RAG_EMBEDDING_BASE_URL=https://your-embedding-compatible-endpoint/v1
 
-FEISHU_INTENT_MODEL_ID=your-org/your-private-intent-model
-HF_TOKEN=your_huggingface_token_for_private_model
+# Production intent model loading:
+# FEISHU_INTENT_MODEL_ID=your-org/your-private-intent-model
+# HF_TOKEN=your_huggingface_token_for_private_model
+
+# Local development intent model loading:
+# FEISHU_INTENT_MODEL_PATH=./intent_model
 ```
 
 Notes:
 - If you use a Qwen embedding endpoint, keep the provider model id lowercase, for example `qwen3-embedding-4b`
 - If you start from a Feishu wiki URL such as `https://.../wiki/HjPjwGtbrikafFkN6sdcSe9zn0d`, set `FEISHU_WIKI_ROOT_TOKENS` to the trailing node token: `HjPjwGtbrikafFkN6sdcSe9zn0d`
-- The intent model should be a private Hugging Face SetFit model. For local development, set `FEISHU_INTENT_MODEL_PATH` to a local model directory; this overrides `FEISHU_INTENT_MODEL_ID`.
+- The intent gate supports five labels: `greeting`, `knowledge_deposit`, `kb_search`, `follow_up`, and `chitchat`.
+- In production, load the private intent model from Hugging Face with `FEISHU_INTENT_MODEL_ID` and `HF_TOKEN`.
+- For local development, set `FEISHU_INTENT_MODEL_PATH` to a local model directory; it takes precedence over the Hugging Face model id.
 
 Optional variables:
 
 ```env
-FEISHU_RAG_TOP_K=4
 FEISHU_RAG_COLLECTION=feishu_wiki_docs
 FEISHU_RAG_DATA_DIR=./data
 FEISHU_RAG_MANIFEST=index_manifest.json
+FEISHU_AGENT_CHECKPOINT_DB_PATH=./data/deepagents/checkpoints.sqlite
 FEISHU_API_BASE=https://open.feishu.cn
 FEISHU_REQUEST_TIMEOUT=20
 WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com
@@ -187,10 +196,20 @@ BOT_CONCURRENCY_ENABLED=true
 BOT_CONCURRENCY_WORKERS=4
 BOT_CONCURRENCY_QUEUE_SIZE=32
 BOT_CONCURRENCY_PER_THREAD_SERIAL=true
+FEISHU_STREAMING_ENABLED=true
+FEISHU_STREAMING_UPDATE_INTERVAL_MS=2500
+FEISHU_STREAMING_MAX_CHARS=6000
+FEISHU_GROUP_CONCURRENCY_MODE=member
+FEISHU_GROUP_MEMORY_RECENT_TURNS=6
+FEISHU_DAILY_HISTORY_CLEANUP_ENABLED=true
+FEISHU_HISTORY_CLEANUP_CHECK_INTERVAL_SECONDS=3600
 
 MULTIMODAL_RAG_QDRANT_URL=http://127.0.0.1:6333
 MULTIMODAL_RAG_QDRANT_API_KEY=
 MULTIMODAL_RAG_QDRANT_COLLECTION=feishu_wiki_docs
+MULTIMODAL_RAG_CHAT_MODEL=
+MULTIMODAL_RAG_VLM_MODEL=
+MULTIMODAL_RAG_EMBEDDING_MODEL=
 MULTIMODAL_RAG_VECTOR_SIZE=1536
 MULTIMODAL_RAG_TOP_K=6
 MULTIMODAL_RAG_RERANK_TOP_K=4
@@ -215,6 +234,25 @@ The example-specific variables still take precedence when present.
 If you already have a valid Weixin iLink token, you can also set:
 
 - `WEIXIN_TOKEN`
+
+### Model Selection
+
+- `FEISHU_RAG_MODEL` is the main runtime model. It is used by the controller agent and its subagents, including `knowledge_retriever` and `knowledge_depositor`; this is the most important setting for Feishu reply latency.
+- `MULTIMODAL_RAG_CHAT_MODEL` is used by the standalone multimodal RAG answer generator, such as direct `RAGQueryPipeline.run()` or API query flows. The Feishu Deep Agent path uses retrieved context from the RAG pipeline but writes the final reply with `FEISHU_RAG_MODEL`.
+- `MULTIMODAL_RAG_VLM_MODEL` is used for image OCR, captioning, and visual understanding during image indexing or deposit flows.
+- `MULTIMODAL_RAG_EMBEDDING_MODEL` is used for ingest and retrieval vectors. If you change it, rebuild the index and update `MULTIMODAL_RAG_VECTOR_SIZE` to match the provider output dimension.
+
+For text-only deployments, use a fast text model for `FEISHU_RAG_MODEL` and keep a VLM model only in `MULTIMODAL_RAG_VLM_MODEL`.
+
+### Conversation History Cleanup
+
+The Feishu channel keeps Deep Agent checkpoints in `data/deepagents/checkpoints.sqlite` so conversations can use thread history. To prevent long-running deployments from accumulating unlimited context, the channel runs a daily maintenance task by default:
+
+- `FEISHU_DAILY_HISTORY_CLEANUP_ENABLED=true` enables the cleanup worker.
+- `FEISHU_HISTORY_CLEANUP_CHECK_INTERVAL_SECONDS=3600` checks once per hour whether today's cleanup has run.
+- Feishu runtime checkpoints whose thread id starts with `feishu__` are removed once per day.
+- Group chat memory files under `data/group_memory/feishu/` are compacted to the latest `FEISHU_GROUP_MEMORY_RECENT_TURNS` turns.
+- Cleanup metadata is written to `data/maintenance/feishu_history_cleanup.json`.
 
 ## Xiaohongshu MCP Setup
 
@@ -438,11 +476,19 @@ Then test it in Weixin:
 - images are passed as local files through the existing `images=[...]` agent interface
 - files are parsed locally and sent as extracted markdown plus any extracted images
 
+## Troubleshooting
+
+- `processor not found, type: im.message.message_read_v1`: this is a Lark SDK warning for a read-receipt event that the channel does not register. It does not block normal message receive/reply behavior.
+- Qdrant connection refused: make sure Qdrant is listening on `MULTIMODAL_RAG_QDRANT_URL`, usually `http://127.0.0.1:6333`, before indexing or querying.
+- Intent model loads from the wrong place: `FEISHU_INTENT_MODEL_PATH` has priority over `FEISHU_INTENT_MODEL_ID`. Unset the local path when testing Hugging Face loading.
+- Slow Feishu replies: check `request_summary` logs for `intent_ms`, `retrieval_ms`, and `llm_ms`. If `llm_ms` dominates, try a faster `FEISHU_RAG_MODEL`.
+
 ## Notes
 
 - Only `FEISHU_EVENT_MODE=websocket` is supported in this version
 - The main Feishu runtime now uses Deep Agents as the orchestration layer
 - Documentation retrieval is delegated to a dedicated `knowledge_retriever` subagent
+- Feishu conversation checkpoints are cleaned once per day by default to avoid unbounded context growth
 - This project currently replies with text only, even if image-derived OCR/caption chunks are indexed
 - Group chats only trigger a response when the bot is mentioned
 - The first Weixin version only supports personal direct chat and text replies
