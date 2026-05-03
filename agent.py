@@ -95,10 +95,7 @@ except ModuleNotFoundError:  # pragma: no cover - imported lazily in tests
 
 NON_RETRIEVAL_INTENTS = {
     "greeting",
-    "summarize",
-    "web_search",
     "follow_up",
-    "image_only",
     "chitchat",
     "knowledge_deposit",
 }
@@ -125,6 +122,7 @@ _LOCAL_GREETING_TEXTS = {
 _LOCAL_INTENT_NORMALIZER_RE = re.compile(r"[\s\.,，。!！?？~～、…]+")
 
 DEPOSIT_TRIGGER_PATTERN = re.compile(r"(沉淀到知识库|沉淀到库|保存到知识库|收录到知识库|入库|沉淀一下|归档到知识库)")
+IMAGE_RETRIEVAL_TRIGGER_PATTERN = re.compile(r"(知识库|检索|搜索|查一下|查找|找资料|找一下|找找|资料|文档|记录|之前存|收藏)")
 
 _AGENT_RUNTIME_CACHE: dict[tuple[str, str, str, str], Any] = {}
 _CHECKPOINTER_CACHE: dict[str, Any] = {}
@@ -170,17 +168,16 @@ def _maybe_fast_path_query_understand(question: str, images: list[str]) -> Query
 
 
 def _should_skip_images_for_query_understand(question: str, images: list[str]) -> bool:
-    if not images:
+    return bool(images)
+
+
+def _should_disable_retrieval_for_images(question: str, images: list[str], intent: str) -> bool:
+    if intent == "knowledge_deposit" or not images:
         return False
     stripped = str(question or "").strip()
-    if not stripped or not _is_knowledge_deposit_request(stripped):
+    if _is_knowledge_deposit_request(stripped):
         return False
-    return (
-        "[来源类型] 链接" in stripped
-        or "http://" in stripped
-        or "https://" in stripped
-        or "mp.weixin.qq.com" in stripped
-    )
+    return IMAGE_RETRIEVAL_TRIGGER_PATTERN.search(stripped) is None
 
 
 def _trim_history_for_controller(intent: str, history: list[HistoryTurn]) -> list[HistoryTurn]:
@@ -218,6 +215,7 @@ class ControllerInputContext:
     raw_question: str
     rewrite_query: str
     intent: str
+    allow_retrieval: bool
     image_description: str
     raw_output: str
     history: list[HistoryTurn]
@@ -753,6 +751,15 @@ def _build_controller_context(
         )
     history = _trim_history_for_controller(understand_result.intent, history)
     allow_retrieval = _intent_requires_retrieval(understand_result.intent)
+    if _should_disable_retrieval_for_images(question, images, understand_result.intent):
+        allow_retrieval = False
+        log_event(
+            "image_direct_answer_selected",
+            thread_id=thread_id,
+            intent=understand_result.intent,
+            image_count=len(images),
+            question_preview=_question_preview(question),
+        )
     controller_decision = ControllerDecision.from_query_understand(
         understand_result,
         fallback_question=question,
@@ -795,6 +802,7 @@ def _build_controller_context(
         raw_question=question,
         rewrite_query=controller_decision.rewrite_query,
         intent=controller_decision.intent,
+        allow_retrieval=controller_decision.allow_retrieval,
         image_description=understand_result.image_description,
         raw_output=understand_result.raw_output,
         history=history,
@@ -810,7 +818,7 @@ def _build_controller_context(
     record_request_timing("intent_ms", elapsed_ms)
     update_request_state(
         intent=context.intent,
-        allow_retrieval=controller_decision.allow_retrieval,
+        allow_retrieval=context.allow_retrieval,
         rewrite_query=controller_decision.rewrite_query,
         question_preview=_question_preview(question),
         history_turn_count=len(history),
@@ -1035,8 +1043,10 @@ def build_agent(settings: Settings | None = None) -> Any:
                 "description": "Retrieve documentation context from the indexed Feishu knowledge base.",
                 "system_prompt": (
                     "You are a retrieval specialist for indexed Feishu documentation. "
-                    "Always call `search_feishu_knowledge` before responding. "
-                    "Return concise retrieval findings, likely sources, and note when nothing relevant was found."
+                    "Always call `search_feishu_knowledge` before responding, but only in your first tool-call turn. "
+                    "In that first turn, you may issue multiple distinct `search_feishu_knowledge` calls in parallel when useful. "
+                    "After any search results are returned, do not call `search_feishu_knowledge` again. "
+                    "Summarize from the returned results, include likely sources, and note when nothing relevant was found."
                 ),
                 "tools": [search_feishu_knowledge],
                 "skills": ["/skills/"],
@@ -1084,13 +1094,12 @@ def extract_final_text(result: dict[str, Any]) -> str:
     return "当前索引中未找到相关内容。"
 
 
-def _status_for_intent(intent: str) -> tuple[str, str]:
+def _status_for_intent(intent: str, allow_retrieval: bool | None = None) -> tuple[str, str]:
     if intent == "knowledge_deposit":
         return "deposit", "正在解析材料并沉淀到知识库..."
-    if _intent_requires_retrieval(intent):
+    retrieval_allowed = _intent_requires_retrieval(intent) if allow_retrieval is None else allow_retrieval
+    if retrieval_allowed:
         return "retrieval", "正在检索知识库..."
-    if intent == "image_only":
-        return "generation", "正在整理图片理解结果..."
     return "generation", "正在生成回复..."
 
 
@@ -1173,7 +1182,10 @@ def invoke_agent_stream(
                 multimodal_settings=multimodal_settings,
                 agent_runtime=agent,
             )
-            status_stage, status_text = _status_for_intent(controller_context.intent)
+            status_stage, status_text = _status_for_intent(
+                controller_context.intent,
+                controller_context.allow_retrieval,
+            )
             yield StreamEvent.status(status_text, stage=status_stage, metadata={"intent": controller_context.intent})
             if controller_context.intent == "knowledge_deposit":
                 raw_message_context = message_context if isinstance(message_context, dict) else {}
@@ -1246,7 +1258,7 @@ def invoke_agent_stream(
             final_text = extract_final_text(final_state)
             update_request_state(
                 intent=controller_context.intent,
-                allow_retrieval=_intent_requires_retrieval(controller_context.intent),
+                allow_retrieval=controller_context.allow_retrieval,
                 answer_length=len(final_text),
                 answer_preview=_question_preview(final_text),
                 question_preview=_question_preview(question),

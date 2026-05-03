@@ -7,11 +7,13 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Callable
@@ -210,6 +212,9 @@ class FeishuChannel:
         )
         self.bot_open_id: str | None = None
         self._startup_cutoff_ms: int = 0  # connection-start cutoff in epoch ms
+        self._history_cleanup_stop = threading.Event()
+        self._history_cleanup_thread: threading.Thread | None = None
+        self._history_cleanup_lock = threading.Lock()
 
     def _build_dispatcher(self) -> ConcurrentMessageDispatcher | None:
         if not self.settings.bot_concurrency_enabled:
@@ -223,8 +228,107 @@ class FeishuChannel:
 
     def shutdown(self) -> None:
         """Release channel-owned worker resources."""
+        self._stop_history_cleanup_worker()
         if self.dispatcher is not None:
             self.dispatcher.shutdown(wait=True)
+
+    def _start_history_cleanup_worker(self) -> None:
+        if not self.settings.feishu_daily_history_cleanup_enabled:
+            return
+        self._run_daily_history_cleanup_if_due()
+        if self._history_cleanup_thread is not None and self._history_cleanup_thread.is_alive():
+            return
+        self._history_cleanup_stop.clear()
+        self._history_cleanup_thread = threading.Thread(
+            target=self._history_cleanup_loop,
+            name="feishu-history-cleanup",
+            daemon=True,
+        )
+        self._history_cleanup_thread.start()
+
+    def _stop_history_cleanup_worker(self) -> None:
+        self._history_cleanup_stop.set()
+        thread = self._history_cleanup_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
+        self._history_cleanup_thread = None
+
+    def _history_cleanup_loop(self) -> None:
+        interval_seconds = max(60, int(self.settings.feishu_history_cleanup_check_interval_seconds))
+        while not self._history_cleanup_stop.wait(interval_seconds):
+            self._run_daily_history_cleanup_if_due()
+
+    def _run_daily_history_cleanup_if_due(self) -> None:
+        today = datetime.now().date().isoformat()
+        marker_path = self.settings.rag_data_dir / "maintenance" / "feishu_history_cleanup.json"
+        with self._history_cleanup_lock:
+            if self._history_cleanup_marker_date(marker_path) == today:
+                return
+            checkpoint_stats = self._clear_feishu_runtime_checkpoints()
+            group_stats = self.group_memory_store.compact_all_to_recent(
+                limit=self.settings.feishu_group_memory_recent_turns
+            )
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(
+                json.dumps(
+                    {
+                        "last_cleanup_date": today,
+                        "cleaned_at": datetime.now().isoformat(timespec="seconds"),
+                        "checkpoint_stats": checkpoint_stats,
+                        "group_memory_stats": group_stats,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            log_event(
+                "daily_history_cleanup_completed",
+                channel="feishu",
+                cleanup_date=today,
+                **checkpoint_stats,
+                **{f"group_memory_{key}": value for key, value in group_stats.items()},
+            )
+
+    @staticmethod
+    def _history_cleanup_marker_date(marker_path: Path) -> str:
+        try:
+            parsed = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return ""
+        if not isinstance(parsed, dict):
+            return ""
+        return str(parsed.get("last_cleanup_date", "")).strip()
+
+    def _clear_feishu_runtime_checkpoints(self) -> dict[str, int]:
+        stats = {"removed_checkpoints": 0, "removed_writes": 0}
+        db_path = self.settings.checkpoint_db_path
+        if not db_path.exists():
+            return stats
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                stats["removed_writes"] = conn.execute(
+                    "DELETE FROM writes WHERE thread_id LIKE ?",
+                    ("feishu__%",),
+                ).rowcount
+                stats["removed_checkpoints"] = conn.execute(
+                    "DELETE FROM checkpoints WHERE thread_id LIKE ?",
+                    ("feishu__%",),
+                ).rowcount
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            log_exception(
+                "daily_history_checkpoint_cleanup_failed",
+                exc,
+                level=logging.WARNING,
+                channel="feishu",
+                checkpoint_db_path=str(db_path),
+            )
+        return stats
 
     def _get_docreader(self) -> DocreaderService:
         service = getattr(self._docreader_local, "service", None)
@@ -311,7 +415,11 @@ class FeishuChannel:
                 event_handler=event_handler,
                 log_level=sdk.LogLevel.WARNING,
             )
-            websocket_client.start()
+            self._start_history_cleanup_worker()
+            try:
+                websocket_client.start()
+            finally:
+                self._stop_history_cleanup_worker()
             log_event(
                 "channel_connection_closed",
                 level=logging.WARNING,

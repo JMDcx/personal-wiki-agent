@@ -1,69 +1,96 @@
-"""Standalone query-understand service.
+"""Intent gate for controller-agent routing.
 
-This module reproduces WeKnora's QUERY_UNDERSTAND stage as a single model call
-that performs query rewrite, intent classification, and image understanding.
+The controller agent now owns query rewriting and image understanding. This
+service only classifies the current user turn into the small SetFit intent set
+used before entering the Deep Agent runtime.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Callable, Literal
+from pathlib import Path
+from typing import Any, Literal
 
 from multimodal_rag_agent.config import MultimodalRAGSettings, get_multimodal_settings
-from multimodal_rag_agent.multimodal_image_pipeline.image_payload import build_normalized_image_data_uri
-from multimodal_rag_agent.rag_query_pipeline.query_understand_prompts import (
-    QUERY_UNDERSTAND_SYSTEM_PROMPT,
-    QUERY_UNDERSTAND_USER_PROMPT,
-)
+
 try:
     from feishu_wiki_rag_agent.observability.events import log_event, preview_text
 except ModuleNotFoundError:  # pragma: no cover - source tree fallback
     from observability.events import log_event, preview_text
 
-try:
-    from langchain_core.messages import HumanMessage, SystemMessage
-except ModuleNotFoundError:  # pragma: no cover - local fallback
-    HumanMessage = None  # type: ignore[assignment]
-    SystemMessage = None  # type: ignore[assignment]
-
-try:
-    from langchain_openai import ChatOpenAI
-except ModuleNotFoundError:  # pragma: no cover - local fallback
-    ChatOpenAI = None  # type: ignore[assignment]
-
 
 QueryIntent = Literal[
     "greeting",
-    "summarize",
-    "web_search",
     "knowledge_deposit",
     "kb_search",
-    "clarification",
     "follow_up",
-    "image_only",
     "chitchat",
 ]
 
-VALID_INTENTS: set[str] = {
-    "greeting",
-    "summarize",
-    "web_search",
-    "knowledge_deposit",
-    "kb_search",
-    "clarification",
-    "follow_up",
-    "image_only",
-    "chitchat",
+INTENT_LABELS: dict[int, QueryIntent] = {
+    0: "greeting",
+    1: "knowledge_deposit",
+    2: "kb_search",
+    3: "follow_up",
+    4: "chitchat",
 }
+VALID_INTENTS: set[str] = set(INTENT_LABELS.values())
 DEFAULT_INTENT: QueryIntent = "kb_search"
+
+_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+
+
+class _LightweightSetFitIntentModel:
+    """Minimal SetFit inference path for exported sentence-transformer models."""
+
+    def __init__(self, model_dir: str | Path) -> None:
+        from tokenizers import Tokenizer
+        from transformers import AutoModel
+        import joblib
+        import torch
+
+        self.torch = torch
+        self.tokenizer = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
+        self.body = AutoModel.from_pretrained(str(model_dir))
+        self.body.eval()
+        self.head = joblib.load(Path(model_dir) / "model_head.pkl")
+
+    def predict(self, queries: list[str]) -> list[Any]:
+        if not queries:
+            return []
+        encoded = self.tokenizer.encode_batch(queries)
+        max_len = min(128, max(len(item.ids) for item in encoded))
+        input_ids: list[list[int]] = []
+        attention: list[list[int]] = []
+        token_types: list[list[int]] = []
+        for item in encoded:
+            ids = item.ids[:max_len]
+            mask = [1] * len(ids)
+            types = (item.type_ids or [0] * len(ids))[:max_len]
+            pad = max_len - len(ids)
+            input_ids.append(ids + [0] * pad)
+            attention.append(mask + [0] * pad)
+            token_types.append(types + [0] * pad)
+
+        with self.torch.no_grad():
+            output = self.body(
+                input_ids=self.torch.tensor(input_ids),
+                attention_mask=self.torch.tensor(attention),
+                token_type_ids=self.torch.tensor(token_types),
+            )
+            token_embeddings = output.last_hidden_state
+            mask = self.torch.tensor(attention).unsqueeze(-1).expand(token_embeddings.size()).float()
+            embeddings = (token_embeddings * mask).sum(1) / self.torch.clamp(mask.sum(1), min=1e-9)
+        return list(self.head.predict(embeddings.numpy()))
 
 
 @dataclass(slots=True)
 class HistoryTurn:
-    """Minimal conversation turn used for query understanding."""
+    """Minimal conversation turn available to the controller agent."""
 
     user_question: str
     assistant_answer: str
@@ -71,7 +98,7 @@ class HistoryTurn:
 
 @dataclass(slots=True)
 class ModelConfig:
-    """OpenAI-compatible model configuration."""
+    """Compatibility shim for older query-understand call sites."""
 
     model: str
     api_key: str = ""
@@ -80,7 +107,7 @@ class ModelConfig:
 
 @dataclass(slots=True)
 class QueryUnderstandResult:
-    """Structured output for the query-understand stage."""
+    """Structured output consumed by the controller-agent runtime."""
 
     rewrite_query: str
     intent: QueryIntent = DEFAULT_INTENT
@@ -95,152 +122,19 @@ class QueryUnderstandResult:
         }
 
 
-@dataclass(slots=True)
-class SelectedModel:
-    """Resolved runtime model choice."""
-
-    config: ModelConfig
-    use_images: bool
-    max_tokens: int
-
-
 class QueryUnderstandService:
-    """Run rewrite, intent classification, and image analysis in one call."""
+    """Classify intent with a SetFit model and leave rewriting to the agent."""
 
     def __init__(
         self,
         settings: MultimodalRAGSettings | None = None,
         *,
-        chat_model: ModelConfig | None = None,
-        model_factory: Callable[[ModelConfig, float, int], Any] | None = None,
-        now_provider: Callable[[], datetime] | None = None,
+        model_loader: Callable[[], Any] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         self.settings = settings or get_multimodal_settings()
-        self.chat_model = chat_model or ModelConfig(
-            model=self.settings.chat_model,
-            api_key=self.settings.chat_api_key,
-            base_url=self.settings.chat_base_url,
-        )
-        self.model_factory = model_factory or self._default_model_factory
-        self.now_provider = now_provider or datetime.now
-
-    def select_model(
-        self,
-        *,
-        images: list[str],
-        chat_model_supports_vision: bool,
-        vlm_model: ModelConfig | None = None,
-    ) -> SelectedModel:
-        has_images = bool(images)
-        if has_images:
-            if chat_model_supports_vision:
-                return SelectedModel(config=self.chat_model, use_images=True, max_tokens=500)
-            if vlm_model is not None:
-                return SelectedModel(config=vlm_model, use_images=True, max_tokens=500)
-        return SelectedModel(config=self.chat_model, use_images=False, max_tokens=150 if not has_images else 500)
-
-    def build_prompts(
-        self,
-        *,
-        query: str,
-        history: list[HistoryTurn],
-        language: str,
-    ) -> tuple[str, str]:
-        conversation = self.format_history(history)
-        current_time = self.now_provider().isoformat(timespec="seconds")
-        system_prompt = QUERY_UNDERSTAND_SYSTEM_PROMPT.format(language=language)
-        user_prompt = QUERY_UNDERSTAND_USER_PROMPT.format(
-            current_time=current_time,
-            conversation=conversation,
-            query=query,
-        )
-        return system_prompt, user_prompt
-
-    def format_history(self, history: list[HistoryTurn]) -> str:
-        if not history:
-            return ""
-        parts: list[str] = []
-        for turn in history:
-            parts.append("------BEGIN------")
-            parts.append(f"User question: {turn.user_question}")
-            parts.append(f"Assistant answer: {turn.assistant_answer}")
-            parts.append("------END------")
-        return "\n".join(parts)
-
-    def merge_image_desc_and_ocr(self, desc: str, ocr: str) -> str:
-        clean_desc = desc.strip()
-        clean_ocr = ocr.strip()
-        if not clean_desc and not clean_ocr:
-            return ""
-        if not clean_desc:
-            return clean_ocr
-        if not clean_ocr:
-            return clean_desc
-        if clean_ocr in clean_desc:
-            return clean_desc
-        return f"{clean_desc}\n\n[OCR]\n{clean_ocr}"
-
-    def parse_output(self, raw_text: str) -> QueryUnderstandResult:
-        content = (raw_text or "").strip()
-        if not content:
-            self._log_schema_warning("empty_output", raw_output=raw_text)
-            return QueryUnderstandResult(rewrite_query="", intent=DEFAULT_INTENT, image_description="", raw_output="")
-
-        parsed = self._try_parse_json(content)
-        if parsed is None:
-            start = content.find("{")
-            end = content.rfind("}")
-            if start != -1 and end > start:
-                parsed = self._try_parse_json(content[start : end + 1])
-
-        if parsed is None:
-            self._log_schema_warning("json_parse_failed", raw_output=content)
-            return QueryUnderstandResult(
-                rewrite_query=content,
-                intent=DEFAULT_INTENT,
-                image_description="",
-                raw_output=content,
-            )
-
-        rewrite_query = str(
-            parsed.get("rewrite_query")
-            or parsed.get("rewritten_query")
-            or parsed.get("query")
-            or parsed.get("question")
-            or ""
-        ).strip()
-        raw_intent = parsed.get("intent")
-        intent = self._normalize_intent(raw_intent)
-        if str(raw_intent or "").strip() and intent == DEFAULT_INTENT and str(raw_intent).strip() != DEFAULT_INTENT:
-            self._log_schema_warning(
-                "invalid_intent",
-                raw_output=content,
-                original_intent=str(raw_intent).strip(),
-            )
-        image_description = self.merge_image_desc_and_ocr(
-            str(
-                parsed.get("image_description")
-                or parsed.get("image_desc")
-                or parsed.get("image_text")
-                or parsed.get("image_ocr_text")
-                or parsed.get("description")
-                or ""
-            ),
-            str(
-                parsed.get("ocr_text")
-                or parsed.get("ocr")
-                or parsed.get("full_ocr")
-                or parsed.get("image_ocr")
-                or parsed.get("ocr_content")
-                or ""
-            ),
-        )
-        return QueryUnderstandResult(
-            rewrite_query=rewrite_query,
-            intent=intent,
-            image_description=image_description,
-            raw_output=content,
-        )
+        self.model_loader = model_loader or self._load_configured_model
+        self.env = env if env is not None else os.environ
 
     def run(
         self,
@@ -252,131 +146,167 @@ class QueryUnderstandService:
         chat_model_supports_vision: bool = False,
         vlm_model: ModelConfig | None = None,
     ) -> QueryUnderstandResult:
-        history = history or []
-        images = images or []
-        selected_model = self.select_model(
-            images=images,
-            chat_model_supports_vision=chat_model_supports_vision,
-            vlm_model=vlm_model,
-        )
-        system_prompt, user_prompt = self.build_prompts(query=query, history=history, language=language)
-        model = self.model_factory(selected_model.config, 0.3, selected_model.max_tokens)
-        messages = self._build_messages(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            images=images,
-            use_images=selected_model.use_images,
-        )
-        response = model.invoke(messages)
-        raw_output = self._extract_text(response)
-        parsed = self.parse_output(raw_output)
-        rewrite_query = parsed.rewrite_query or query.strip()
-        if not parsed.rewrite_query.strip():
-            self._log_schema_warning(
-                "missing_rewrite_query",
-                raw_output=raw_output,
-                fallback_query=preview_text(query),
+        del history, images, language, chat_model_supports_vision, vlm_model
+        clean_query = str(query or "").strip()
+        try:
+            model = self.model_loader()
+            label = self._predict_label(model, clean_query)
+            intent = self._normalize_intent(label)
+            raw_output = json.dumps(
+                {
+                    "source": "setfit_intent_model",
+                    "label": str(label),
+                    "intent": intent,
+                },
+                ensure_ascii=False,
             )
-        image_description = parsed.image_description if images else ""
+            log_event(
+                "intent_model_classified",
+                intent=intent,
+                raw_label=str(label),
+                question_preview=preview_text(clean_query),
+            )
+        except Exception as exc:  # pragma: no cover - exercised through tests with fake loader
+            intent = DEFAULT_INTENT
+            raw_output = json.dumps(
+                {
+                    "source": "setfit_intent_model",
+                    "status": "fallback",
+                    "intent": intent,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                ensure_ascii=False,
+            )
+            self._log_schema_warning(
+                "intent_model_failed",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                fallback_intent=intent,
+                question_preview=preview_text(clean_query),
+            )
         return QueryUnderstandResult(
-            rewrite_query=rewrite_query,
-            intent=self._normalize_intent(parsed.intent),
-            image_description=image_description,
+            rewrite_query=clean_query,
+            intent=intent,
+            image_description="",
             raw_output=raw_output,
         )
 
-    def _build_messages(
-        self,
-        *,
-        system_prompt: str,
-        user_prompt: str,
-        images: list[str],
-        use_images: bool,
-    ) -> list[Any]:
-        if SystemMessage is None or HumanMessage is None:  # pragma: no cover - local fallback
-            return [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": self._build_message_content_for_images(user_prompt, images) if use_images else user_prompt,
-                },
-            ]
-        return [
-            SystemMessage(content=system_prompt),
-            HumanMessage(
-                content=self._build_message_content_for_images(user_prompt, images) if use_images else user_prompt
-            ),
-        ]
+    def _load_configured_model(self) -> Any:
+        model_ref, source = self._resolve_model_ref()
+        cache_key = (source, model_ref)
+        if cache_key in _MODEL_CACHE:
+            return _MODEL_CACHE[cache_key]
 
-    def _build_message_content_for_images(self, user_prompt: str, images: list[str]) -> list[dict[str, Any]]:
-        content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
-        for image_path in images:
-            data_uri = build_normalized_image_data_uri(image_path)
-            content.append({"type": "image_url", "image_url": {"url": data_uri}})
-        return content
-
-    def _default_model_factory(self, config: ModelConfig, temperature: float, max_tokens: int) -> Any:
-        if ChatOpenAI is None:  # pragma: no cover - local fallback
-            msg = "langchain_openai is required to run QueryUnderstandService."
-            raise RuntimeError(msg)
+        token = str(self.env.get("HF_TOKEN", "")).strip() or None
         log_event(
-            "query_understand_model_selected",
-            model=config.model,
-            has_base_url=bool(config.base_url),
-            max_tokens=max_tokens,
-            request_timeout=self.settings.query_understand_timeout_seconds,
-            max_retries=self.settings.query_understand_max_retries,
+            "intent_model_loading",
+            model_source=source,
+            model_ref=model_ref,
+            has_hf_token=bool(token),
         )
-        return ChatOpenAI(
-            model=config.model,
-            api_key=config.api_key or None,
-            base_url=config.base_url or None,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            request_timeout=self.settings.query_understand_timeout_seconds,
-            max_retries=self.settings.query_understand_max_retries,
-        )
-
-    @staticmethod
-    def _extract_text(response: Any) -> str:
-        content = getattr(response, "content", response)
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            text_parts: list[str] = []
-            for item in content:
-                if isinstance(item, str):
-                    text_parts.append(item)
-                    continue
-                if isinstance(item, dict):
-                    if isinstance(item.get("text"), str):
-                        text_parts.append(item["text"])
-                    elif item.get("type") == "text" and isinstance(item.get("content"), str):
-                        text_parts.append(item["content"])
-            return "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
-        return str(content).strip()
-
-    @staticmethod
-    def _try_parse_json(raw_text: str) -> dict[str, Any] | None:
         try:
-            parsed = json.loads(raw_text)
-        except json.JSONDecodeError:
-            return None
-        return parsed if isinstance(parsed, dict) else None
+            from setfit import SetFitModel
+
+            model = SetFitModel.from_pretrained(model_ref, token=token)
+        except TypeError:
+            try:
+                model = SetFitModel.from_pretrained(model_ref, use_auth_token=token)
+            except TypeError:
+                model = SetFitModel.from_pretrained(model_ref)
+        except (ImportError, ModuleNotFoundError) as exc:
+            log_event(
+                "intent_model_setfit_unavailable",
+                level=logging.WARNING,
+                model_source=source,
+                model_ref=model_ref,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            model = self._load_lightweight_model(model_ref, source=source, token=token)
+        _MODEL_CACHE[cache_key] = model
+        return model
 
     @staticmethod
-    def _normalize_intent(intent: Any) -> QueryIntent:
-        value = str(intent or "").strip()
-        if value in VALID_INTENTS:
-            return value  # type: ignore[return-value]
-        return DEFAULT_INTENT
+    def _load_lightweight_model(model_ref: str, *, source: str, token: str | None) -> _LightweightSetFitIntentModel:
+        if source == "local_path":
+            return _LightweightSetFitIntentModel(model_ref)
+
+        try:
+            from huggingface_hub import snapshot_download
+        except ModuleNotFoundError as exc:  # pragma: no cover - installed with setfit in normal env
+            msg = "huggingface_hub is required to download the intent model fallback."
+            raise RuntimeError(msg) from exc
+
+        model_dir = snapshot_download(repo_id=model_ref, token=token)
+        return _LightweightSetFitIntentModel(model_dir)
+
+    def _resolve_model_ref(self) -> tuple[str, str]:
+        local_path = str(self.env.get("FEISHU_INTENT_MODEL_PATH", "")).strip()
+        if local_path:
+            path = Path(local_path).expanduser()
+            if not path.exists():
+                msg = f"FEISHU_INTENT_MODEL_PATH does not exist: {path}"
+                raise FileNotFoundError(msg)
+            return str(path), "local_path"
+
+        model_id = str(self.env.get("FEISHU_INTENT_MODEL_ID", "")).strip()
+        if model_id:
+            return model_id, "huggingface"
+
+        msg = "Set FEISHU_INTENT_MODEL_ID or FEISHU_INTENT_MODEL_PATH to enable intent classification."
+        raise RuntimeError(msg)
+
+    @classmethod
+    def _predict_label(cls, model: Any, query: str) -> Any:
+        if hasattr(model, "predict"):
+            prediction = model.predict([query])
+        else:
+            prediction = model([query])
+        return cls._first_prediction(prediction)
+
+    @classmethod
+    def _first_prediction(cls, prediction: Any) -> Any:
+        if hasattr(prediction, "detach"):
+            prediction = prediction.detach().cpu().tolist()
+        elif hasattr(prediction, "tolist"):
+            prediction = prediction.tolist()
+        if isinstance(prediction, Sequence) and not isinstance(prediction, str):
+            if not prediction:
+                return ""
+            return cls._first_prediction(prediction[0])
+        return prediction
+
+    @classmethod
+    def _normalize_intent(cls, intent: Any) -> QueryIntent:
+        if isinstance(intent, str):
+            value = intent.strip()
+            if value in VALID_INTENTS:
+                return value  # type: ignore[return-value]
+            try:
+                numeric = int(value)
+            except ValueError:
+                cls._log_schema_warning("invalid_intent", original_intent=value, fallback_intent=DEFAULT_INTENT)
+                return DEFAULT_INTENT
+        else:
+            try:
+                numeric = int(intent)
+            except (TypeError, ValueError):
+                cls._log_schema_warning("invalid_intent", original_intent=str(intent), fallback_intent=DEFAULT_INTENT)
+                return DEFAULT_INTENT
+
+        normalized = INTENT_LABELS.get(numeric)
+        if normalized is None:
+            cls._log_schema_warning("invalid_intent_label", original_label=numeric, fallback_intent=DEFAULT_INTENT)
+            return DEFAULT_INTENT
+        return normalized
 
     @staticmethod
     def _log_schema_warning(reason: str, **fields: object) -> None:
         log_event(
             "schema_normalization_warning",
             level=logging.WARNING,
-            schema_stage="query_understand",
+            schema_stage="intent_classification",
             reason=reason,
             **fields,
         )

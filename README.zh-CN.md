@@ -11,6 +11,7 @@
 - 基于 websocket 的飞书机器人集成
 - 基于官方 iLink bot API 的个人微信接入
 - 以 Deep Agents runtime 作为主编排层
+- 进入主控 agent 前使用 SetFit 小模型做五类意图识别
 - 面向文档类问题的专用检索子 agent
 - 面向外部链接、文本、图片的知识沉淀链路
 - 将飞书 Wiki 和 Docs 内容写入 Qdrant
@@ -29,11 +30,12 @@
 1. 飞书或微信将用户消息交给通道层
 2. `channel/feishu/feishu_channel.py` 或 `channel/weixin/weixin_channel.py` 对消息进行标准化
 3. 通道层把附件适配成文本提示和可选本地图片路径
-4. `agent.py` 使用稳定的 `thread_id` 调用 Deep Agent runtime
-5. 主 agent 判断当前请求是否需要知识检索
-6. 检索型问题会被委派给 `knowledge_retriever` 子 agent
-7. 检索子 agent 使用多模态 `RAGQueryPipeline` 从 Qdrant 中准备上下文
-8. 主 agent 生成最终回复，再由通道发送回用户
+4. `agent.py` 使用五类 SetFit 意图模型判断当前消息类型
+5. `agent.py` 使用稳定的 `thread_id` 调用 Deep Agent runtime
+6. 主 agent 根据当前问题、历史、回复上下文和群聊元数据自行完成检索 query 改写
+7. 检索型问题会被委派给 `knowledge_retriever` 子 agent
+8. 检索子 agent 使用多模态 `RAGQueryPipeline` 从 Qdrant 中准备上下文
+9. 主 agent 生成最终回复，再由通道发送回用户
 
 索引链路如下：
 
@@ -156,11 +158,15 @@ FEISHU_RAG_CHAT_BASE_URL=https://your-chat-compatible-endpoint/v1
 FEISHU_RAG_EMBEDDING_MODEL=your_embedding_model_name
 FEISHU_RAG_EMBEDDING_API_KEY=your_embedding_api_key
 FEISHU_RAG_EMBEDDING_BASE_URL=https://your-embedding-compatible-endpoint/v1
+
+FEISHU_INTENT_MODEL_ID=your-org/your-private-intent-model
+HF_TOKEN=your_huggingface_token_for_private_model
 ```
 
 注意：
 - 如果你使用 Qwen embedding，模型名请保持 provider 要求的小写形式，例如 `qwen3-embedding-4b`
 - 如果你拿到的是飞书 wiki 链接，例如 `https://.../wiki/HjPjwGtbrikafFkN6sdcSe9zn0d`，则 `FEISHU_WIKI_ROOT_TOKENS` 应填写链接末尾的 node token，即 `HjPjwGtbrikafFkN6sdcSe9zn0d`
+- 意图模型应使用私有 Hugging Face SetFit 仓库。开发时可以设置 `FEISHU_INTENT_MODEL_PATH` 指向本地模型目录，它会优先于 `FEISHU_INTENT_MODEL_ID`。
 
 可选变量：
 

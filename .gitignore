@@ -12,6 +12,9 @@ __pycache__/
 /data/qdrant_storage/
 /data/qdrant_storage/**
 
+/intent_model/
+/intent_model/**
+
 *.egg-info/
 .coverage
 htmlcov/

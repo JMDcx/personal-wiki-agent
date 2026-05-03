@@ -32,8 +32,10 @@ def render_controller_user_input(
     lines.extend(
         [
             "turn_policy:",
-            "- If allow_retrieval is yes, use rewrite_query when delegating retrieval.",
+            "- If allow_retrieval is yes, build a self-contained retrieval query before delegating retrieval.",
+            "- Use rewrite_query only as the current raw query hint; resolve references from recent_history, reply_context, group metadata, and the current question yourself.",
             "- If allow_retrieval is no, answer directly and do not call knowledge_retriever.",
+            "- If images are present and allow_retrieval is no, answer directly using your multimodal understanding of the images.",
             "- Treat mentioned_users as part of the user's intent and conversational reference.",
             "- Use mention_details when you need stable identity hints for group-chat references.",
             "- When reply_context is present, treat parent_text_preview as the conversational anchor for deictic follow-ups.",

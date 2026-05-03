@@ -153,6 +153,12 @@ class Settings:
     feishu_group_memory_recent_turns: int = field(
         default_factory=lambda: int(os.getenv("FEISHU_GROUP_MEMORY_RECENT_TURNS", "6"))
     )
+    feishu_daily_history_cleanup_enabled: bool = field(
+        default_factory=lambda: _bool_env("FEISHU_DAILY_HISTORY_CLEANUP_ENABLED", True)
+    )
+    feishu_history_cleanup_check_interval_seconds: int = field(
+        default_factory=lambda: int(os.getenv("FEISHU_HISTORY_CLEANUP_CHECK_INTERVAL_SECONDS", "3600"))
+    )
     bot_concurrency_enabled: bool = field(default_factory=lambda: _bool_env("BOT_CONCURRENCY_ENABLED", True))
     bot_concurrency_workers: int = field(default_factory=lambda: int(os.getenv("BOT_CONCURRENCY_WORKERS", "4")))
     bot_concurrency_queue_size: int = field(

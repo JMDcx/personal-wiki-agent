@@ -27,6 +27,7 @@ class FeishuGroupMemoryStore:
         self.max_recent_turns = max(0, int(max_recent_turns))
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        self._global_file_lock = threading.Lock()
 
     def recent_turns(self, chat_id: str, limit: int | None = None) -> list[dict[str, object]]:
         """Return the most recent completed turns for one group chat."""
@@ -39,7 +40,7 @@ class FeishuGroupMemoryStore:
         lock = self._lock_for_chat(normalized_chat_id)
         path = self._path_for_chat(normalized_chat_id)
         try:
-            with lock:
+            with self._global_file_lock, lock:
                 if not path.exists():
                     return []
                 turns: list[dict[str, object]] = []
@@ -84,7 +85,7 @@ class FeishuGroupMemoryStore:
         lock = self._lock_for_chat(normalized_chat_id)
         path = self._path_for_chat(normalized_chat_id)
         try:
-            with lock:
+            with self._global_file_lock, lock:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -104,6 +105,42 @@ class FeishuGroupMemoryStore:
                 chat_id=normalized_chat_id,
                 message_id=record["message_id"],
             )
+
+    def compact_all_to_recent(self, limit: int | None = None) -> dict[str, int]:
+        """Rewrite all group memory files so only recent turns are retained."""
+        resolved_limit = self.max_recent_turns if limit is None else max(0, int(limit))
+        stats = {"file_count": 0, "kept_turn_count": 0, "removed_turn_count": 0}
+        if not self.root_dir.exists():
+            return stats
+        try:
+            with self._global_file_lock:
+                for path in sorted(self.root_dir.glob("*.jsonl")):
+                    if not path.is_file():
+                        continue
+                    turns: list[dict[str, object]] = []
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        parsed = self._parse_line(line)
+                        if parsed is not None:
+                            turns.append(parsed)
+                    kept_turns = turns[-resolved_limit:] if resolved_limit > 0 else []
+                    if kept_turns:
+                        path.write_text(
+                            "".join(json.dumps(turn, ensure_ascii=False) + "\n" for turn in kept_turns),
+                            encoding="utf-8",
+                        )
+                    else:
+                        path.unlink(missing_ok=True)
+                    stats["file_count"] += 1
+                    stats["kept_turn_count"] += len(kept_turns)
+                    stats["removed_turn_count"] += max(0, len(turns) - len(kept_turns))
+        except Exception as exc:  # noqa: BLE001
+            log_exception(
+                "group_memory_compact_failed",
+                exc,
+                level=logging.WARNING,
+                channel="feishu",
+            )
+        return stats
 
     def _path_for_chat(self, chat_id: str) -> Path:
         safe_chat_id = _SAFE_ID_RE.sub("_", chat_id).strip("._") or "unknown"

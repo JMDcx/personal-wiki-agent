@@ -11,6 +11,7 @@ This project indexes Feishu Wiki and Docs content into Qdrant and answers user q
 - Feishu bot integration over websocket
 - Personal Weixin integration over the official iLink bot API
 - Deep Agents runtime as the main orchestration layer
+- SetFit intent gate before the controller agent
 - Dedicated retrieval subagent for documentation questions
 - Dedicated knowledge-deposit flow for external links, text, and images
 - Feishu Wiki and Docs ingestion into Qdrant
@@ -29,11 +30,12 @@ The main runtime flow is:
 1. Feishu or Weixin delivers an incoming user message to the channel layer
 2. `channel/feishu/feishu_channel.py` or `channel/weixin/weixin_channel.py` normalizes the message
 3. The channel adapts attachments into a text prompt plus optional local image paths
-4. `agent.py` invokes the Deep Agent runtime with a stable `thread_id`
-5. The main agent decides whether the request needs knowledge retrieval
-6. Retrieval-heavy questions are delegated to the `knowledge_retriever` subagent
-7. The retrieval subagent uses the multimodal `RAGQueryPipeline` to prepare context from Qdrant
-8. The main agent produces the final reply and the channel sends it back to the user
+4. `agent.py` classifies the turn with a five-class SetFit intent model
+5. `agent.py` invokes the Deep Agent runtime with a stable `thread_id`
+6. The main agent rewrites retrieval queries from the current message, history, reply context, and group metadata
+7. Retrieval-heavy questions are delegated to the `knowledge_retriever` subagent
+8. The retrieval subagent uses the multimodal `RAGQueryPipeline` to prepare context from Qdrant
+9. The main agent produces the final reply and the channel sends it back to the user
 
 The indexing flow is:
 
@@ -156,11 +158,15 @@ FEISHU_RAG_CHAT_BASE_URL=https://your-chat-compatible-endpoint/v1
 FEISHU_RAG_EMBEDDING_MODEL=your_embedding_model_name
 FEISHU_RAG_EMBEDDING_API_KEY=your_embedding_api_key
 FEISHU_RAG_EMBEDDING_BASE_URL=https://your-embedding-compatible-endpoint/v1
+
+FEISHU_INTENT_MODEL_ID=your-org/your-private-intent-model
+HF_TOKEN=your_huggingface_token_for_private_model
 ```
 
 Notes:
 - If you use a Qwen embedding endpoint, keep the provider model id lowercase, for example `qwen3-embedding-4b`
 - If you start from a Feishu wiki URL such as `https://.../wiki/HjPjwGtbrikafFkN6sdcSe9zn0d`, set `FEISHU_WIKI_ROOT_TOKENS` to the trailing node token: `HjPjwGtbrikafFkN6sdcSe9zn0d`
+- The intent model should be a private Hugging Face SetFit model. For local development, set `FEISHU_INTENT_MODEL_PATH` to a local model directory; this overrides `FEISHU_INTENT_MODEL_ID`.
 
 Optional variables:
 
