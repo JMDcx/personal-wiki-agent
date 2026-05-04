@@ -65,9 +65,19 @@ class DepositPipeline:
             ImageAdapter(self.multimodal_settings),
         ]
         self.writer = writer or FeishuDepositWriter(self.settings)
-        self.ingest_pipeline = ingest_pipeline or IngestPipeline(self.multimodal_settings)
+        self._ingest_pipeline = ingest_pipeline
         self.summarizer = summarizer or self._build_draft
         self.now_provider = now_provider or datetime.now
+
+    @property
+    def ingest_pipeline(self) -> IngestPipeline:
+        if self._ingest_pipeline is None:
+            self._ingest_pipeline = IngestPipeline(self.multimodal_settings)
+        return self._ingest_pipeline
+
+    @ingest_pipeline.setter
+    def ingest_pipeline(self, value: IngestPipeline | None) -> None:
+        self._ingest_pipeline = value
 
     def run(self, request: DepositRequest) -> DepositResult:
         started_at = perf_counter()
