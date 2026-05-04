@@ -30,6 +30,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    "ruff>=0.15.0",
 ]
 
 [build-system]

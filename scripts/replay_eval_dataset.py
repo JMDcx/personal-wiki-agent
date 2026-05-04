@@ -256,7 +256,7 @@ def _build_markdown_report(
     errored_results = [result for result in results if result.status != "ok"]
 
     lines: list[str] = [
-        f"# 回放评测报告",
+        "# 回放评测报告",
         "",
         f"- 运行 ID: `{run_id}`",
         f"- 数据集: `{dataset_path}`",

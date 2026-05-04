@@ -22,10 +22,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config import get_settings
-from multimodal_rag_agent.deposit_pipeline.adapters import DepositSourceError
-from multimodal_rag_agent.deposit_pipeline.models import DepositRequest
-from multimodal_rag_agent.deposit_pipeline.pipeline import DepositPipeline
+from config import get_settings  # noqa: E402
+from multimodal_rag_agent.deposit_pipeline.adapters import DepositSourceError  # noqa: E402
+from multimodal_rag_agent.deposit_pipeline.models import DepositRequest  # noqa: E402
+from multimodal_rag_agent.deposit_pipeline.pipeline import DepositPipeline  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:

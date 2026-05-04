@@ -5,8 +5,6 @@ from __future__ import annotations
 from pprint import pprint
 
 from multimodal_rag_agent.rag_query_pipeline.query_understand_service import (
-    HistoryTurn,
-    ModelConfig,
     QueryUnderstandService,
 )
 

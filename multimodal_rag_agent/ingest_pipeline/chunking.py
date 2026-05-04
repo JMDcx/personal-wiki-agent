@@ -153,7 +153,6 @@ class MarkdownChunker:
         segment = text[start:end]
         if not segment:
             return []
-        indices = [start]
         for sep in separators:
             if sep in segment:
                 units: list[tuple[int, int, str]] = []
