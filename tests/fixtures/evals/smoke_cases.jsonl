@@ -1,0 +1,5 @@
+{"id":"smoke_greeting_001","user_query":"你好","expected_intent":"chat","expected_allow_retrieval":false,"expected_answer_must_include":["你好"],"tags":["smoke","chat"]}
+{"id":"smoke_kb_basic_001","user_query":"这个知识库主要支持什么能力？","expected_intent":"kb_search","expected_allow_retrieval":true,"expected_answer_must_include":["知识库"],"expected_source_titles":["项目说明"],"expected_match_status":"matched","tags":["smoke","retrieval"]}
+{"id":"smoke_kb_no_match_001","user_query":"知识库里有没有火星基地报销制度？","expected_intent":"kb_search","expected_allow_retrieval":true,"expected_answer_must_include":["没有找到"],"expected_answer_must_not_include":["火星基地报销制度已经发布"],"expected_match_status":"no_match","tags":["smoke","no_match"]}
+{"id":"smoke_followup_001","user_query":"那它怎么更新？","history":[{"user_question":"这个项目是什么？","assistant_answer":"这是一个飞书知识库问答 Agent。"}],"expected_intent":"kb_search","expected_allow_retrieval":true,"expected_answer_must_include":["更新"],"tags":["smoke","history"]}
+{"id":"smoke_deposit_intent_001","user_query":"帮我把这段内容沉淀到知识库：今天排查了一个登录问题","expected_intent":"knowledge_deposit","expected_allow_retrieval":false,"expected_answer_must_include":["知识库"],"tags":["smoke","deposit"]}
